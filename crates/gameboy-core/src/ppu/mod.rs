@@ -1,0 +1,862 @@
+pub const SCREEN_WIDTH: usize = 160;
+pub const SCREEN_HEIGHT: usize = 144;
+pub const FRAMEBUFFER_PIXELS: usize = SCREEN_WIDTH * SCREEN_HEIGHT;
+
+use crate::memory::MemoryRegion;
+
+const DOTS_PER_LINE: u32 = 456;
+const VISIBLE_LINES: u8 = 144;
+const LINES_PER_FRAME: u8 = 154;
+const MODE_2_DOTS: u32 = 80;
+const MODE_3_DOTS: u32 = 252;
+const VRAM_SIZE: usize = 0x2000;
+const OAM_SIZE: usize = 0xA0;
+const OAM_ENTRY_BYTES: usize = 4;
+const SPRITE_COUNT: usize = 40;
+const MAX_SPRITES_PER_LINE: usize = 10;
+const TILE_BYTES: usize = 16;
+const TILE_MAP_SIZE: usize = 32;
+const DMG_COLORS: [u32; 4] = [0xFFFF_FFFF, 0xFFAA_AAAA, 0xFF55_5555, 0xFF00_0000];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PpuMode {
+    HBlank = 0,
+    VBlank = 1,
+    OamScan = 2,
+    Drawing = 3,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ppu {
+    lcdc: u8,
+    stat: u8,
+    scy: u8,
+    scx: u8,
+    ly: u8,
+    lyc: u8,
+    wy: u8,
+    wx: u8,
+    bgp: u8,
+    obp0: u8,
+    obp1: u8,
+    mode: PpuMode,
+    line_dots: u32,
+    window_line: u8,
+    frame_ready: bool,
+    vram: MemoryRegion<VRAM_SIZE>,
+    oam: MemoryRegion<OAM_SIZE>,
+    framebuffer: Vec<u32>,
+    bg_color_ids: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PpuInterrupts {
+    pub vblank: bool,
+    pub stat: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Sprite {
+    oam_index: usize,
+    x: i16,
+    y: i16,
+    tile: u8,
+    attributes: u8,
+    line: usize,
+}
+
+impl Default for Ppu {
+    fn default() -> Self {
+        Self {
+            lcdc: 0x91,
+            stat: 0x85,
+            scy: 0,
+            scx: 0,
+            ly: 0,
+            lyc: 0,
+            wy: 0,
+            wx: 0,
+            bgp: 0xFC,
+            obp0: 0xFF,
+            obp1: 0xFF,
+            mode: PpuMode::OamScan,
+            line_dots: 0,
+            window_line: 0,
+            frame_ready: false,
+            vram: MemoryRegion::default(),
+            oam: MemoryRegion::default(),
+            framebuffer: vec![0; FRAMEBUFFER_PIXELS],
+            bg_color_ids: vec![0; FRAMEBUFFER_PIXELS],
+        }
+    }
+}
+
+impl Ppu {
+    pub fn advance_cycles(&mut self, cycles: u32) -> PpuInterrupts {
+        let mut interrupts = PpuInterrupts::default();
+        if !self.lcd_enabled() {
+            return interrupts;
+        }
+
+        self.line_dots += cycles;
+        while self.line_dots >= DOTS_PER_LINE {
+            if self.ly < VISIBLE_LINES {
+                self.render_scanline();
+            }
+
+            self.line_dots -= DOTS_PER_LINE;
+            self.ly = (self.ly + 1) % LINES_PER_FRAME;
+
+            if self.ly == VISIBLE_LINES {
+                self.set_mode(PpuMode::VBlank);
+                self.frame_ready = true;
+                interrupts.vblank = true;
+                interrupts.stat |= self.stat_interrupt_enabled(4);
+            } else if self.ly == 0 {
+                self.window_line = 0;
+                self.set_mode(PpuMode::OamScan);
+                interrupts.stat |= self.stat_interrupt_enabled(5);
+            }
+
+            interrupts.stat |= self.update_lyc_flag();
+        }
+
+        if self.ly < VISIBLE_LINES {
+            let next_mode = match self.line_dots {
+                0..MODE_2_DOTS => PpuMode::OamScan,
+                MODE_2_DOTS..MODE_3_DOTS => PpuMode::Drawing,
+                _ => PpuMode::HBlank,
+            };
+
+            if next_mode != self.mode {
+                self.set_mode(next_mode);
+                interrupts.stat |= match next_mode {
+                    PpuMode::HBlank => self.stat_interrupt_enabled(3),
+                    PpuMode::OamScan => self.stat_interrupt_enabled(5),
+                    PpuMode::VBlank => self.stat_interrupt_enabled(4),
+                    PpuMode::Drawing => false,
+                };
+            }
+        }
+
+        interrupts
+    }
+
+    pub fn read_register(&self, address: u16) -> Option<u8> {
+        match address {
+            0xFF40 => Some(self.lcdc),
+            0xFF41 => Some((self.stat & 0xFC) | self.mode as u8 | 0x80),
+            0xFF42 => Some(self.scy),
+            0xFF43 => Some(self.scx),
+            0xFF44 => Some(self.ly),
+            0xFF45 => Some(self.lyc),
+            0xFF47 => Some(self.bgp),
+            0xFF48 => Some(self.obp0),
+            0xFF49 => Some(self.obp1),
+            0xFF4A => Some(self.wy),
+            0xFF4B => Some(self.wx),
+            _ => None,
+        }
+    }
+
+    pub fn write_register(&mut self, address: u16, value: u8) -> bool {
+        match address {
+            0xFF40 => {
+                let was_enabled = self.lcd_enabled();
+                self.lcdc = value;
+                if was_enabled && !self.lcd_enabled() {
+                    self.ly = 0;
+                    self.line_dots = 0;
+                    self.window_line = 0;
+                    self.frame_ready = false;
+                    self.set_mode(PpuMode::HBlank);
+                    self.update_lyc_flag();
+                } else if !was_enabled && self.lcd_enabled() {
+                    self.ly = 0;
+                    self.line_dots = 0;
+                    self.window_line = 0;
+                    self.set_mode(PpuMode::OamScan);
+                    self.update_lyc_flag();
+                }
+                true
+            }
+            0xFF41 => {
+                self.stat = (self.stat & 0x07) | (value & 0x78) | 0x80;
+                true
+            }
+            0xFF42 => {
+                self.scy = value;
+                true
+            }
+            0xFF43 => {
+                self.scx = value;
+                true
+            }
+            0xFF44 => {
+                self.ly = 0;
+                self.line_dots = 0;
+                self.window_line = 0;
+                self.set_mode(if self.lcd_enabled() {
+                    PpuMode::OamScan
+                } else {
+                    PpuMode::HBlank
+                });
+                self.update_lyc_flag();
+                true
+            }
+            0xFF45 => {
+                self.lyc = value;
+                self.update_lyc_flag();
+                true
+            }
+            0xFF47 => {
+                self.bgp = value;
+                true
+            }
+            0xFF48 => {
+                self.obp0 = value;
+                true
+            }
+            0xFF49 => {
+                self.obp1 = value;
+                true
+            }
+            0xFF4A => {
+                self.wy = value;
+                true
+            }
+            0xFF4B => {
+                self.wx = value;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub fn mode(&self) -> PpuMode {
+        self.mode
+    }
+
+    pub fn framebuffer(&self) -> &[u32] {
+        &self.framebuffer
+    }
+
+    pub fn take_frame_ready(&mut self) -> bool {
+        let ready = self.frame_ready;
+        self.frame_ready = false;
+        ready
+    }
+
+    pub fn read_vram(&self, address: u16) -> Option<u8> {
+        if self.mode == PpuMode::Drawing && self.lcd_enabled() {
+            return Some(0xFF);
+        }
+
+        self.read_vram_raw(address)
+    }
+
+    pub fn write_vram(&mut self, address: u16, value: u8) -> bool {
+        if self.mode == PpuMode::Drawing && self.lcd_enabled() {
+            return address < VRAM_SIZE as u16;
+        }
+
+        self.write_vram_raw(address, value)
+    }
+
+    pub fn read_oam(&self, address: u16) -> Option<u8> {
+        if matches!(self.mode, PpuMode::OamScan | PpuMode::Drawing) && self.lcd_enabled() {
+            return Some(0xFF);
+        }
+
+        self.read_oam_raw(address)
+    }
+
+    pub fn write_oam(&mut self, address: u16, value: u8) -> bool {
+        if matches!(self.mode, PpuMode::OamScan | PpuMode::Drawing) && self.lcd_enabled() {
+            return address < OAM_SIZE as u16;
+        }
+
+        self.write_oam_raw(address, value)
+    }
+
+    pub fn read_vram_raw(&self, address: u16) -> Option<u8> {
+        self.vram.read(address as usize)
+    }
+
+    pub fn write_vram_raw(&mut self, address: u16, value: u8) -> bool {
+        self.vram.write(address as usize, value)
+    }
+
+    pub fn read_oam_raw(&self, address: u16) -> Option<u8> {
+        self.oam.read(address as usize)
+    }
+
+    pub fn write_oam_raw(&mut self, address: u16, value: u8) -> bool {
+        self.oam.write(address as usize, value)
+    }
+
+    fn lcd_enabled(&self) -> bool {
+        self.lcdc & 0x80 != 0
+    }
+
+    fn render_scanline(&mut self) {
+        if self.ly as usize >= SCREEN_HEIGHT {
+            return;
+        }
+
+        if self.lcdc & 0x01 == 0 {
+            self.clear_scanline();
+            return;
+        }
+
+        let mut window_used = false;
+        for x in 0..SCREEN_WIDTH {
+            let (color_id, color) = if self.window_pixel_visible(x) {
+                window_used = true;
+                self.render_window_pixel(x)
+            } else {
+                self.render_background_pixel(x)
+            };
+
+            let index = self.ly as usize * SCREEN_WIDTH + x;
+            self.bg_color_ids[index] = color_id;
+            self.framebuffer[index] = color;
+        }
+
+        if window_used {
+            self.window_line = self.window_line.wrapping_add(1);
+        }
+
+        self.render_sprites_on_scanline();
+    }
+
+    fn clear_scanline(&mut self) {
+        let start = self.ly as usize * SCREEN_WIDTH;
+        if start >= self.framebuffer.len() {
+            return;
+        }
+
+        self.framebuffer[start..start + SCREEN_WIDTH].fill(DMG_COLORS[0]);
+        self.bg_color_ids[start..start + SCREEN_WIDTH].fill(0);
+        self.render_sprites_on_scanline();
+    }
+
+    fn render_background_pixel(&self, screen_x: usize) -> (u8, u32) {
+        let map_base = if self.lcdc & 0x08 != 0 {
+            0x1C00
+        } else {
+            0x1800
+        };
+        let tile_data_unsigned = self.lcdc & 0x10 != 0;
+        let y = self.ly.wrapping_add(self.scy);
+        let x = (screen_x as u8).wrapping_add(self.scx);
+
+        self.render_tile_pixel(
+            map_base,
+            tile_data_unsigned,
+            x as usize,
+            y as usize,
+            self.bgp,
+        )
+    }
+
+    fn render_window_pixel(&self, screen_x: usize) -> (u8, u32) {
+        let map_base = if self.lcdc & 0x40 != 0 {
+            0x1C00
+        } else {
+            0x1800
+        };
+        let tile_data_unsigned = self.lcdc & 0x10 != 0;
+        let window_x = screen_x.saturating_sub(self.wx.saturating_sub(7) as usize);
+        self.render_tile_pixel(
+            map_base,
+            tile_data_unsigned,
+            window_x,
+            self.window_line as usize,
+            self.bgp,
+        )
+    }
+
+    fn render_tile_pixel(
+        &self,
+        map_base: usize,
+        tile_data_unsigned: bool,
+        x: usize,
+        y: usize,
+        palette: u8,
+    ) -> (u8, u32) {
+        let tile_x = (x / 8) % TILE_MAP_SIZE;
+        let tile_y = (y / 8) % TILE_MAP_SIZE;
+        let col = x % 8;
+        let row = y % 8;
+        let map_offset = map_base + tile_y * TILE_MAP_SIZE + tile_x;
+        let tile_id = self.vram.read(map_offset).unwrap_or(0);
+        let tile_offset = tile_data_offset(tile_id, tile_data_unsigned);
+        let low = self.vram.read(tile_offset + row * 2).unwrap_or(0);
+        let high = self.vram.read(tile_offset + row * 2 + 1).unwrap_or(0);
+        let bit = 7 - col;
+        let color_id = ((high >> bit) & 1) << 1 | ((low >> bit) & 1);
+        (color_id, palette_color(palette, color_id))
+    }
+
+    fn window_pixel_visible(&self, screen_x: usize) -> bool {
+        if self.lcdc & 0x20 == 0 || self.ly < self.wy || self.wx > 166 {
+            return false;
+        }
+
+        let window_left = self.wx.saturating_sub(7) as usize;
+        screen_x >= window_left
+    }
+
+    fn render_sprites_on_scanline(&mut self) {
+        if self.lcdc & 0x02 == 0 || self.ly as usize >= SCREEN_HEIGHT {
+            return;
+        }
+
+        let sprite_height = if self.lcdc & 0x04 != 0 { 16 } else { 8 };
+        let mut sprites = Vec::with_capacity(MAX_SPRITES_PER_LINE);
+
+        for oam_index in 0..SPRITE_COUNT {
+            let offset = oam_index * OAM_ENTRY_BYTES;
+            let y = self.oam.read(offset).unwrap_or(0) as i16 - 16;
+            let x = self.oam.read(offset + 1).unwrap_or(0) as i16 - 8;
+            let tile = self.oam.read(offset + 2).unwrap_or(0);
+            let attributes = self.oam.read(offset + 3).unwrap_or(0);
+            let line = self.ly as i16 - y;
+
+            if line < 0 || line >= sprite_height {
+                continue;
+            }
+
+            sprites.push(Sprite {
+                oam_index,
+                x,
+                y,
+                tile,
+                attributes,
+                line: line as usize,
+            });
+            if sprites.len() == MAX_SPRITES_PER_LINE {
+                break;
+            }
+        }
+
+        sprites.sort_by(|a, b| b.x.cmp(&a.x).then_with(|| b.oam_index.cmp(&a.oam_index)));
+
+        for sprite in sprites {
+            self.render_sprite_line(sprite, sprite_height as usize);
+        }
+    }
+
+    fn render_sprite_line(&mut self, sprite: Sprite, sprite_height: usize) {
+        let y_flip = sprite.attributes & 0x40 != 0;
+        let x_flip = sprite.attributes & 0x20 != 0;
+        let behind_bg = sprite.attributes & 0x80 != 0;
+        let palette = if sprite.attributes & 0x10 != 0 {
+            self.obp1
+        } else {
+            self.obp0
+        };
+        let line = if y_flip {
+            sprite_height - 1 - sprite.line
+        } else {
+            sprite.line
+        };
+        let tile = if sprite_height == 16 {
+            sprite.tile & 0xFE
+        } else {
+            sprite.tile
+        };
+        let tile_offset = tile as usize * TILE_BYTES + line * 2;
+        let low = self.vram.read(tile_offset).unwrap_or(0);
+        let high = self.vram.read(tile_offset + 1).unwrap_or(0);
+
+        for pixel in 0..8 {
+            let screen_x = sprite.x + pixel;
+            if !(0..SCREEN_WIDTH as i16).contains(&screen_x) {
+                continue;
+            }
+
+            let col = if x_flip {
+                pixel as usize
+            } else {
+                7 - pixel as usize
+            };
+            let color_id = ((high >> col) & 1) << 1 | ((low >> col) & 1);
+            if color_id == 0 {
+                continue;
+            }
+
+            let index = self.ly as usize * SCREEN_WIDTH + screen_x as usize;
+            if behind_bg && self.bg_color_ids[index] != 0 {
+                continue;
+            }
+
+            self.framebuffer[index] = palette_color(palette, color_id);
+        }
+    }
+
+    fn set_mode(&mut self, mode: PpuMode) {
+        self.mode = mode;
+        self.stat = (self.stat & !0x03) | mode as u8;
+    }
+
+    fn update_lyc_flag(&mut self) -> bool {
+        if self.ly == self.lyc {
+            let was_set = self.stat & 0x04 != 0;
+            self.stat |= 0x04;
+            !was_set && self.stat_interrupt_enabled(6)
+        } else {
+            self.stat &= !0x04;
+            false
+        }
+    }
+
+    fn stat_interrupt_enabled(&self, bit: u8) -> bool {
+        self.stat & (1 << bit) != 0
+    }
+}
+
+fn tile_data_offset(tile_id: u8, unsigned: bool) -> usize {
+    if unsigned {
+        tile_id as usize * TILE_BYTES
+    } else {
+        (0x1000isize + (tile_id as i8 as isize) * TILE_BYTES as isize) as usize
+    }
+}
+
+fn palette_color(palette: u8, color_id: u8) -> u32 {
+    let shade = (palette >> (color_id * 2)) & 0x03;
+    DMG_COLORS[shade as usize]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn advance_to_hblank(ppu: &mut Ppu) {
+        ppu.advance_cycles(MODE_2_DOTS + MODE_3_DOTS);
+    }
+
+    #[test]
+    fn default_ppu_has_framebuffer_and_oam_mode() {
+        let ppu = Ppu::default();
+
+        assert_eq!(ppu.mode(), PpuMode::OamScan);
+        assert_eq!(ppu.framebuffer().len(), FRAMEBUFFER_PIXELS);
+        assert_eq!(ppu.read_register(0xFF44), Some(0));
+    }
+
+    #[test]
+    fn advances_through_visible_line_modes() {
+        let mut ppu = Ppu::default();
+
+        assert_eq!(ppu.mode(), PpuMode::OamScan);
+        ppu.advance_cycles(80);
+        assert_eq!(ppu.mode(), PpuMode::Drawing);
+        ppu.advance_cycles(172);
+        assert_eq!(ppu.mode(), PpuMode::HBlank);
+        ppu.advance_cycles(204);
+        assert_eq!(ppu.read_register(0xFF44), Some(1));
+        assert_eq!(ppu.mode(), PpuMode::OamScan);
+    }
+
+    #[test]
+    fn enters_vblank_at_line_144_and_latches_frame_ready() {
+        let mut ppu = Ppu::default();
+        let mut interrupts = PpuInterrupts::default();
+
+        for _ in 0..VISIBLE_LINES {
+            interrupts = ppu.advance_cycles(DOTS_PER_LINE);
+        }
+
+        assert_eq!(ppu.read_register(0xFF44), Some(144));
+        assert_eq!(ppu.mode(), PpuMode::VBlank);
+        assert!(interrupts.vblank);
+        assert!(ppu.take_frame_ready());
+        assert!(!ppu.take_frame_ready());
+    }
+
+    #[test]
+    fn stat_lyc_interrupt_is_requested_only_on_new_match() {
+        let mut ppu = Ppu::default();
+
+        ppu.write_register(0xFF41, 0x40);
+        ppu.write_register(0xFF45, 1);
+        let interrupts = ppu.advance_cycles(DOTS_PER_LINE);
+        let repeated = ppu.advance_cycles(4);
+
+        assert!(interrupts.stat);
+        assert!(!repeated.stat);
+        assert_eq!(ppu.read_register(0xFF41).unwrap() & 0x04, 0x04);
+    }
+
+    #[test]
+    fn stat_mode_interrupts_are_requested_on_enabled_transitions() {
+        let mut ppu = Ppu::default();
+        ppu.write_register(0xFF41, 0x28);
+
+        assert!(ppu.advance_cycles(80 + 172).stat);
+        assert!(ppu.advance_cycles(204).stat);
+    }
+
+    #[test]
+    fn disabling_lcd_resets_line_mode_and_frame_state() {
+        let mut ppu = Ppu::default();
+
+        ppu.advance_cycles(DOTS_PER_LINE);
+        ppu.write_register(0xFF40, 0x00);
+
+        assert_eq!(ppu.read_register(0xFF44), Some(0));
+        assert_eq!(ppu.mode(), PpuMode::HBlank);
+        assert!(!ppu.take_frame_ready());
+    }
+
+    #[test]
+    fn stat_register_preserves_read_only_mode_and_lyc_bits() {
+        let mut ppu = Ppu::default();
+
+        ppu.write_register(0xFF41, 0xFF);
+
+        assert_eq!(ppu.read_register(0xFF41), Some(0xFE));
+    }
+
+    #[test]
+    fn vram_reads_and_writes_are_available_to_ppu() {
+        let mut ppu = Ppu::default();
+
+        advance_to_hblank(&mut ppu);
+        assert!(ppu.write_vram(0x123, 0xAB));
+        assert_eq!(ppu.read_vram(0x123), Some(0xAB));
+        assert!(!ppu.write_vram(0x2000, 0x12));
+        assert_eq!(ppu.read_vram(0x2000), None);
+    }
+
+    #[test]
+    fn vram_is_restricted_during_drawing_mode() {
+        let mut ppu = Ppu::default();
+        ppu.write_vram_raw(0x100, 0xAB);
+        ppu.advance_cycles(MODE_2_DOTS);
+
+        assert_eq!(ppu.mode(), PpuMode::Drawing);
+        assert_eq!(ppu.read_vram(0x100), Some(0xFF));
+        assert!(ppu.write_vram(0x100, 0x12));
+        assert_eq!(ppu.read_vram_raw(0x100), Some(0xAB));
+    }
+
+    #[test]
+    fn oam_reads_and_writes_are_available_to_ppu_outside_restricted_modes() {
+        let mut ppu = Ppu::default();
+
+        advance_to_hblank(&mut ppu);
+        assert!(ppu.write_oam(0x10, 0xAB));
+        assert_eq!(ppu.read_oam(0x10), Some(0xAB));
+        assert!(!ppu.write_oam(0xA0, 0x12));
+        assert_eq!(ppu.read_oam(0xA0), None);
+    }
+
+    #[test]
+    fn oam_is_restricted_during_oam_and_drawing_modes() {
+        let mut ppu = Ppu::default();
+        ppu.write_oam_raw(0x10, 0xAB);
+
+        assert_eq!(ppu.read_oam(0x10), Some(0xFF));
+        assert!(ppu.write_oam(0x10, 0x12));
+        assert_eq!(ppu.read_oam_raw(0x10), Some(0xAB));
+        ppu.advance_cycles(MODE_2_DOTS);
+        assert_eq!(ppu.read_oam(0x10), Some(0xFF));
+    }
+
+    #[test]
+    fn renders_background_tile_pixels_into_framebuffer() {
+        let mut ppu = Ppu::default();
+        ppu.write_register(0xFF40, 0x91);
+        ppu.write_register(0xFF47, 0b11_10_01_00);
+        ppu.write_vram_raw(0x1800, 1);
+        ppu.write_vram_raw(TILE_BYTES as u16, 0b1000_0000);
+        ppu.write_vram_raw((TILE_BYTES + 1) as u16, 0);
+
+        ppu.advance_cycles(DOTS_PER_LINE);
+
+        assert_eq!(ppu.framebuffer()[0], DMG_COLORS[1]);
+        assert_eq!(ppu.framebuffer()[1], DMG_COLORS[0]);
+    }
+
+    #[test]
+    fn background_rendering_uses_scroll_registers() {
+        let mut ppu = Ppu::default();
+        ppu.write_register(0xFF40, 0x91);
+        ppu.write_register(0xFF43, 8);
+        ppu.write_vram_raw(0x1801, 2);
+        ppu.write_vram_raw((TILE_BYTES * 2) as u16, 0b1000_0000);
+
+        ppu.advance_cycles(DOTS_PER_LINE);
+
+        assert_eq!(ppu.framebuffer()[0], DMG_COLORS[3]);
+    }
+
+    #[test]
+    fn background_can_use_alternate_tile_map_and_signed_tile_data() {
+        let mut ppu = Ppu::default();
+        ppu.write_register(0xFF40, 0x89);
+        ppu.write_vram_raw(0x1C00, 0xFF);
+        ppu.write_vram_raw(0x0FF0, 0x80);
+
+        ppu.advance_cycles(DOTS_PER_LINE);
+
+        assert_eq!(ppu.framebuffer()[0], DMG_COLORS[3]);
+    }
+
+    #[test]
+    fn window_renders_from_wy_wx_and_selected_tile_map() {
+        let mut ppu = Ppu::default();
+        ppu.write_register(0xFF40, 0xF1);
+        ppu.write_register(0xFF4A, 0);
+        ppu.write_register(0xFF4B, 7);
+        ppu.write_register(0xFF47, 0b11_10_01_00);
+        ppu.write_vram_raw(0x1C00, 3);
+        ppu.write_vram_raw((TILE_BYTES * 3) as u16, 0x80);
+
+        ppu.advance_cycles(DOTS_PER_LINE);
+
+        assert_eq!(ppu.framebuffer()[0], DMG_COLORS[1]);
+        assert_eq!(ppu.framebuffer()[1], DMG_COLORS[0]);
+    }
+
+    #[test]
+    fn window_line_counter_advances_only_on_visible_window_lines() {
+        let mut ppu = Ppu::default();
+        ppu.write_register(0xFF40, 0xF1);
+        ppu.write_register(0xFF4A, 1);
+        ppu.write_register(0xFF4B, 7);
+        ppu.write_register(0xFF47, 0b11_10_01_00);
+        ppu.write_vram_raw(0x1C00, 1);
+        ppu.write_vram_raw(TILE_BYTES as u16, 0x80);
+        ppu.write_vram_raw(TILE_BYTES as u16 + 2, 0xC0);
+        ppu.write_vram_raw(TILE_BYTES as u16 + 3, 0xC0);
+
+        ppu.advance_cycles(DOTS_PER_LINE);
+        ppu.advance_cycles(DOTS_PER_LINE);
+        ppu.advance_cycles(DOTS_PER_LINE);
+
+        assert_eq!(ppu.framebuffer()[SCREEN_WIDTH], DMG_COLORS[1]);
+        assert_eq!(ppu.framebuffer()[SCREEN_WIDTH * 2], DMG_COLORS[3]);
+    }
+
+    #[test]
+    fn renders_sprite_pixels_over_background() {
+        let mut ppu = Ppu::default();
+        ppu.write_register(0xFF40, 0x93);
+        ppu.write_register(0xFF48, 0b11_10_01_00);
+        ppu.write_vram_raw(TILE_BYTES as u16, 0b1000_0000);
+        ppu.write_oam_raw(0, 16);
+        ppu.write_oam_raw(1, 8);
+        ppu.write_oam_raw(2, 1);
+        ppu.write_oam_raw(3, 0);
+
+        ppu.advance_cycles(DOTS_PER_LINE);
+
+        assert_eq!(ppu.framebuffer()[0], DMG_COLORS[1]);
+        assert_eq!(ppu.framebuffer()[1], DMG_COLORS[0]);
+    }
+
+    #[test]
+    fn sprite_color_zero_is_transparent() {
+        let mut ppu = Ppu::default();
+        ppu.write_register(0xFF40, 0x93);
+        ppu.write_vram_raw(0x1800, 2);
+        ppu.write_vram_raw((TILE_BYTES * 2) as u16, 0x80);
+        ppu.write_oam_raw(0, 16);
+        ppu.write_oam_raw(1, 8);
+        ppu.write_oam_raw(2, 1);
+
+        ppu.advance_cycles(DOTS_PER_LINE);
+
+        assert_eq!(ppu.framebuffer()[0], DMG_COLORS[3]);
+    }
+
+    #[test]
+    fn sprite_priority_keeps_nonzero_background_in_front() {
+        let mut ppu = Ppu::default();
+        ppu.write_register(0xFF40, 0x93);
+        ppu.write_vram_raw(0x1800, 2);
+        ppu.write_vram_raw((TILE_BYTES * 2) as u16, 0x80);
+        ppu.write_vram_raw(TILE_BYTES as u16, 0x80);
+        ppu.write_oam_raw(0, 16);
+        ppu.write_oam_raw(1, 8);
+        ppu.write_oam_raw(2, 1);
+        ppu.write_oam_raw(3, 0x80);
+
+        ppu.advance_cycles(DOTS_PER_LINE);
+
+        assert_eq!(ppu.framebuffer()[0], DMG_COLORS[3]);
+    }
+
+    #[test]
+    fn sprite_x_and_y_flip_reverse_pixels() {
+        let mut ppu = Ppu::default();
+        ppu.write_register(0xFF40, 0x93);
+        ppu.write_vram_raw(TILE_BYTES as u16 + 14, 0x01);
+        ppu.write_oam_raw(0, 16);
+        ppu.write_oam_raw(1, 8);
+        ppu.write_oam_raw(2, 1);
+        ppu.write_oam_raw(3, 0x60);
+
+        ppu.advance_cycles(DOTS_PER_LINE);
+
+        assert_eq!(ppu.framebuffer()[0], DMG_COLORS[3]);
+    }
+
+    #[test]
+    fn eight_by_sixteen_sprites_use_even_tile_number() {
+        let mut ppu = Ppu::default();
+        ppu.write_register(0xFF40, 0x97);
+        ppu.write_vram_raw((TILE_BYTES * 2) as u16, 0x80);
+        ppu.write_vram_raw((TILE_BYTES * 3) as u16, 0);
+        ppu.write_oam_raw(0, 16);
+        ppu.write_oam_raw(1, 8);
+        ppu.write_oam_raw(2, 3);
+
+        ppu.advance_cycles(DOTS_PER_LINE);
+
+        assert_eq!(ppu.framebuffer()[0], DMG_COLORS[3]);
+    }
+
+    #[test]
+    fn lower_x_sprite_has_priority_over_higher_x_sprite() {
+        let mut ppu = Ppu::default();
+        ppu.write_register(0xFF40, 0x93);
+        ppu.write_register(0xFF48, 0b11_10_01_00);
+        ppu.write_register(0xFF49, 0b11_10_01_00);
+        ppu.write_vram_raw(TILE_BYTES as u16, 0x80);
+        ppu.write_vram_raw((TILE_BYTES * 2) as u16, 0x80);
+        ppu.write_oam_raw(0, 16);
+        ppu.write_oam_raw(1, 9);
+        ppu.write_oam_raw(2, 1);
+        ppu.write_oam_raw(4, 16);
+        ppu.write_oam_raw(5, 8);
+        ppu.write_oam_raw(6, 2);
+        ppu.write_oam_raw(7, 0x10);
+
+        ppu.advance_cycles(DOTS_PER_LINE);
+
+        assert_eq!(ppu.framebuffer()[1], DMG_COLORS[1]);
+    }
+
+    #[test]
+    fn only_ten_sprites_are_selected_per_scanline() {
+        let mut ppu = Ppu::default();
+        ppu.write_register(0xFF40, 0x93);
+        ppu.write_vram_raw(TILE_BYTES as u16, 0x80);
+        for sprite in 0..11 {
+            let offset = sprite * OAM_ENTRY_BYTES;
+            ppu.write_oam_raw(offset as u16, 16);
+            ppu.write_oam_raw((offset + 1) as u16, (8 + sprite) as u8);
+            ppu.write_oam_raw((offset + 2) as u16, 1);
+        }
+
+        ppu.advance_cycles(DOTS_PER_LINE);
+
+        assert_eq!(ppu.framebuffer()[10], DMG_COLORS[0]);
+    }
+}
