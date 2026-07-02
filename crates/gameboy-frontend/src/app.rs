@@ -1,30 +1,154 @@
-use std::{path::PathBuf, sync::mpsc, time::Duration};
+use std::{
+    path::PathBuf,
+    sync::{mpsc, Arc, Mutex},
+    time::{Duration, Instant},
+};
 
+use eframe::egui_glow;
 use egui::{
-    load::SizedTexture, pos2, vec2, Align2, Color32, CornerRadius, FontId, Key, Margin, RichText,
-    Sense, Stroke, StrokeKind,
+    load::SizedTexture, pos2, vec2, Align, Align2, Color32, CornerRadius, FontId, Key, Layout,
+    Margin, Rect, RichText, Sense, Shape, Stroke, StrokeKind,
 };
 use gameboy_core::ppu::{SCREEN_HEIGHT, SCREEN_WIDTH};
-use gilrs::Gilrs;
+use gameboy_core::{JoypadButton, JoypadState};
+use gilrs::{Button, EventType, Gilrs};
 
 use crate::{
     browser::DirBrowser,
     config::Config,
-    input::{default_controls, read_joypad_state, ControlBinding},
+    input::{default_controls, mappings, read_joypad_state, ControlBinding, InputBinding},
     library::{spawn_scan, RomEntry, ScanResult},
+    renderer::{Pipeline, ShaderParams},
     session::Session,
-    theme,
+    theme::{self, Palette, PaletteKind},
 };
+
+const SHADER_CONTROLS: usize = 8;
+
+const SETTINGS_BUTTONS: [JoypadButton; 8] = [
+    JoypadButton::Up,
+    JoypadButton::Down,
+    JoypadButton::Left,
+    JoypadButton::Right,
+    JoypadButton::A,
+    JoypadButton::B,
+    JoypadButton::Start,
+    JoypadButton::Select,
+];
 
 const FRAME_TIME: Duration = Duration::from_nanos(16_742_706);
 const MAX_FRAMES_PER_TICK: u32 = 8;
+const BOOT_DURATION: Duration = Duration::from_millis(2200);
 
 const ERROR_COLOR: Color32 = Color32::from_rgb(224, 96, 96);
 
+#[derive(Clone, Copy, PartialEq)]
 enum Screen {
-    SetupRomDir,
-    Menu,
+    Boot,
+    Library,
+    Settings,
+    Browser,
     Playing,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Listening {
+    None,
+    Key(JoypadButton),
+    Pad(JoypadButton),
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum SetItem {
+    ChangeFolder,
+    Device,
+    Map(JoypadButton, bool),
+    Palette,
+    Shader(usize),
+}
+
+fn settings_items() -> Vec<SetItem> {
+    let mut items = vec![SetItem::ChangeFolder, SetItem::Device];
+    for button in SETTINGS_BUTTONS {
+        items.push(SetItem::Map(button, false));
+        items.push(SetItem::Map(button, true));
+    }
+    items.push(SetItem::Palette);
+    for i in 0..SHADER_CONTROLS {
+        items.push(SetItem::Shader(i));
+    }
+    items
+}
+
+fn focus_move(
+    cur: SetItem,
+    up: bool,
+    down: bool,
+    left: bool,
+    right: bool,
+) -> Option<SetItem> {
+    use SetItem::*;
+    let last_btn = SETTINGS_BUTTONS.len() - 1;
+    match cur {
+        Map(btn, is_gamepad) => {
+            let bi = SETTINGS_BUTTONS.iter().position(|b| *b == btn)?;
+            if right && !is_gamepad {
+                Some(Map(btn, true))
+            } else if left && is_gamepad {
+                Some(Map(btn, false))
+            } else if down {
+                Some(if bi < last_btn {
+                    Map(SETTINGS_BUTTONS[bi + 1], is_gamepad)
+                } else {
+                    Palette
+                })
+            } else if up {
+                Some(if bi > 0 {
+                    Map(SETTINGS_BUTTONS[bi - 1], is_gamepad)
+                } else {
+                    Device
+                })
+            } else {
+                None
+            }
+        }
+        ChangeFolder => {
+            if down {
+                Some(Device)
+            } else if up {
+                Some(Shader(SHADER_CONTROLS - 1))
+            } else {
+                None
+            }
+        }
+        Device => {
+            if down {
+                Some(Map(SETTINGS_BUTTONS[0], false))
+            } else if up {
+                Some(ChangeFolder)
+            } else {
+                None
+            }
+        }
+        Palette => {
+            if down {
+                Some(Shader(0))
+            } else if up {
+                Some(Map(SETTINGS_BUTTONS[last_btn], false))
+            } else {
+                None
+            }
+        }
+        Shader(k) => {
+            if down {
+                Some(if k + 1 < SHADER_CONTROLS { Shader(k + 1) } else { ChangeFolder })
+            } else if up {
+                Some(if k > 0 { Shader(k - 1) } else { Palette })
+            } else {
+                None
+            }
+        }
+    }
 }
 
 enum ScanState {
@@ -34,12 +158,13 @@ enum ScanState {
     Error(String),
 }
 
-#[derive(Default)]
-struct MenuActions {
-    open_browser: bool,
-    resume: bool,
-    stop: bool,
-    launch: Option<RomEntry>,
+impl ScanState {
+    fn entries(&self) -> &[RomEntry] {
+        match self {
+            ScanState::Ready(entries) => entries,
+            _ => &[],
+        }
+    }
 }
 
 pub struct App {
@@ -54,6 +179,17 @@ pub struct App {
     texture: Option<egui::TextureHandle>,
     rgba: Vec<u8>,
     error: Option<String>,
+    boot_started: Option<Instant>,
+    sel: usize,
+    device_idx: usize,
+    play_accumulated: Duration,
+    play_since: Option<Instant>,
+    prev_pad: JoypadState,
+    listening: Listening,
+    browser_from: Screen,
+    settings_focus: usize,
+    settings_scroll: bool,
+    pipeline: Arc<Mutex<Option<Pipeline>>>,
 }
 
 impl App {
@@ -64,7 +200,7 @@ impl App {
         let browser = DirBrowser::new(config.rom_dir.clone());
 
         let mut app = Self {
-            screen: Screen::SetupRomDir,
+            screen: Screen::Boot,
             browser,
             scan: ScanState::Idle,
             session: None,
@@ -74,21 +210,53 @@ impl App {
             texture: None,
             rgba: vec![0; SCREEN_WIDTH * SCREEN_HEIGHT * 4],
             error: None,
+            boot_started: Some(Instant::now()),
+            sel: 0,
+            device_idx: 0,
+            play_accumulated: Duration::ZERO,
+            play_since: None,
+            prev_pad: JoypadState::new(),
+            listening: Listening::None,
+            browser_from: Screen::Library,
+            settings_focus: 0,
+            settings_scroll: false,
+            pipeline: Arc::new(Mutex::new(None)),
             config,
         };
 
         if let Some(dir) = app.config.rom_dir.clone() {
             if dir.is_dir() {
                 app.start_scan(dir);
-                app.screen = Screen::Menu;
             }
         }
 
         app
     }
 
+    fn palette(&self) -> Palette {
+        self.config.palette.palette()
+    }
+
     fn start_scan(&mut self, dir: PathBuf) {
         self.scan = ScanState::Scanning(spawn_scan(dir));
+    }
+
+    fn poll_scan(&mut self, ctx: &egui::Context) {
+        if let ScanState::Scanning(rx) = &self.scan {
+            match rx.try_recv() {
+                Ok(Ok(entries)) => {
+                    self.sel = self.sel.min(entries.len().saturating_sub(1));
+                    self.scan = ScanState::Ready(entries);
+                }
+                Ok(Err(err)) => self.scan = ScanState::Error(err),
+                Err(mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint_after(Duration::from_millis(50))
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.scan = ScanState::Error("scan thread stopped unexpectedly".to_string())
+                }
+            }
+        }
     }
 
     fn flush_saves(&mut self) {
@@ -99,225 +267,813 @@ impl App {
         }
     }
 
+    fn bank_playtime(&mut self) {
+        if let Some(since) = self.play_since.take() {
+            self.play_accumulated += since.elapsed();
+        }
+    }
+
+    fn total_playtime(&self) -> Duration {
+        self.play_accumulated + self.play_since.map(|s| s.elapsed()).unwrap_or_default()
+    }
+
     fn pause(&mut self) {
+        self.bank_playtime();
         self.flush_saves();
-        self.screen = Screen::Menu;
+        self.screen = Screen::Library;
     }
 
     fn resume(&mut self) {
         if self.session.is_some() {
+            self.play_since = Some(Instant::now());
             self.screen = Screen::Playing;
         }
     }
 
     fn stop(&mut self) {
+        self.bank_playtime();
         self.flush_saves();
         self.session = None;
         self.current = None;
+        self.play_accumulated = Duration::ZERO;
         if let Some(dir) = self.config.rom_dir.clone() {
             self.start_scan(dir);
         }
-        self.screen = Screen::Menu;
+        self.screen = Screen::Library;
     }
 
     fn launch(&mut self, entry: RomEntry) {
+        self.bank_playtime();
         self.flush_saves();
         self.session = None;
         self.current = None;
+        self.play_accumulated = Duration::ZERO;
 
         match Session::start(&entry.path) {
             Ok(session) => {
                 self.session = Some(session);
                 self.current = Some(entry);
                 self.error = None;
+                self.play_since = Some(Instant::now());
                 self.screen = Screen::Playing;
             }
             Err(err) => {
                 self.error = Some(err);
-                self.screen = Screen::Menu;
+                self.screen = Screen::Library;
             }
         }
     }
 
-    fn open_browser(&mut self) {
+    fn open_browser(&mut self, from: Screen) {
         self.browser = DirBrowser::new(self.config.rom_dir.clone());
-        self.screen = Screen::SetupRomDir;
+        self.browser_from = from;
+        self.screen = Screen::Browser;
     }
 
-    fn is_current(&self, entry: &RomEntry) -> bool {
-        self.current
-            .as_ref()
-            .is_some_and(|current| current.path == entry.path)
-    }
-
-    fn ui_setup(&mut self, ui: &mut egui::Ui) {
-        egui::Panel::top("setup_header").show(ui, |ui| {
-            ui.add_space(14.0);
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("●").color(theme::GREEN).size(14.0));
-                ui.heading("Choose your ROM folder");
-            });
-            ui.add_space(2.0);
-            ui.label(
-                RichText::new(
-                    "Pick the folder that contains your Game Boy ROMs. \
-                     It will be remembered for next time.",
-                )
-                .color(theme::WEAK),
-            );
-            ui.add_space(12.0);
-        });
-
-        egui::CentralPanel::default().show(ui, |ui| {
-            if let Some(dir) = self.browser.ui(ui) {
-                self.config.rom_dir = Some(dir.clone());
-                self.start_scan(dir);
-                self.screen = Screen::Menu;
-            }
-        });
-    }
-
-    fn ui_menu(&mut self, ui: &mut egui::Ui) {
-        let ctx = ui.ctx().clone();
-
-        if let ScanState::Scanning(rx) = &self.scan {
-            match rx.try_recv() {
-                Ok(Ok(entries)) => self.scan = ScanState::Ready(entries),
-                Ok(Err(err)) => self.scan = ScanState::Error(err),
-                Err(mpsc::TryRecvError::Empty) => {
-                    ctx.request_repaint_after(Duration::from_millis(50))
-                }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    self.scan = ScanState::Error("scan thread stopped unexpectedly".to_string())
-                }
-            }
-        }
-
-        let mut actions = MenuActions::default();
-
-        egui::Panel::top("menu_header").show(ui, |ui| {
-            ui.add_space(12.0);
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("●").color(theme::GREEN).size(15.0));
-                ui.heading("Game Boy");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("📂  Change folder").clicked() {
-                        actions.open_browser = true;
-                    }
-                });
-            });
-            if let Some(dir) = &self.config.rom_dir {
-                ui.add_space(2.0);
-                ui.label(RichText::new(dir.display().to_string()).color(theme::WEAK).small());
-            }
-            ui.add_space(12.0);
-        });
-
-        egui::CentralPanel::default().show(ui, |ui| {
-            if let Some(error) = &self.error {
-                ui.colored_label(ERROR_COLOR, error);
-                ui.add_space(6.0);
-            }
-
-            if self.session.is_some() {
-                self.now_playing_card(ui, &mut actions);
-                ui.add_space(10.0);
-            }
-
-            match &self.scan {
-                ScanState::Scanning(_) | ScanState::Idle => {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label(RichText::new("Scanning for ROMs…").color(theme::WEAK));
-                    });
-                }
-                ScanState::Error(err) => {
-                    ui.colored_label(ERROR_COLOR, err.clone());
-                }
-                ScanState::Ready(entries) if entries.is_empty() => {
-                    ui.label("No .gb or .gbc ROMs found in this folder.");
-                    ui.add_space(6.0);
-                    if ui.button("Choose a different folder").clicked() {
-                        actions.open_browser = true;
-                    }
-                }
-                ScanState::Ready(entries) => {
-                    egui::ScrollArea::vertical()
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            for entry in entries {
-                                let current = self.is_current(entry);
-                                if rom_row(ui, entry, current).clicked() {
-                                    if current {
-                                        actions.resume = true;
-                                    } else {
-                                        actions.launch = Some(entry.clone());
-                                    }
-                                }
-                            }
-                        });
-                }
-            }
-        });
-
-        if actions.open_browser {
-            self.open_browser();
-        } else if actions.stop {
-            self.stop();
-        } else if actions.resume {
-            self.resume();
-        } else if let Some(entry) = actions.launch {
-            self.launch(entry);
+    fn after_boot(&mut self) {
+        self.boot_started = None;
+        if self.config.rom_dir.as_ref().is_some_and(|d| d.is_dir()) {
+            self.screen = Screen::Library;
+        } else {
+            self.open_browser(Screen::Library);
         }
     }
 
-    fn now_playing_card(&self, ui: &mut egui::Ui, actions: &mut MenuActions) {
-        egui::Frame::default()
-            .fill(theme::GREEN_TINT)
-            .stroke(Stroke::new(1.0, theme::GREEN))
-            .corner_radius(CornerRadius::same(12))
-            .inner_margin(Margin::same(12))
+    fn handle_menu_input(&mut self, ctx: &egui::Context, captured_pad: Option<Button>) {
+        let pad = ctx.input(|i| read_joypad_state(i, self.gilrs.as_mut(), &self.controls));
+        let just = |b: JoypadButton| pad.is_pressed(b) && !self.prev_pad.is_pressed(b);
+        let up = just(JoypadButton::Up);
+        let down = just(JoypadButton::Down);
+        let left = just(JoypadButton::Left);
+        let right = just(JoypadButton::Right);
+        let select = just(JoypadButton::A) || just(JoypadButton::Start);
+        let back_btn = just(JoypadButton::B);
+        let menu_btn = just(JoypadButton::Select);
+        self.prev_pad = pad;
+
+        let (esc, captured_key) = ctx.input(|i| {
+            let esc = i.key_pressed(Key::Escape);
+            let key = i.events.iter().find_map(|e| match e {
+                egui::Event::Key {
+                    key,
+                    pressed: true,
+                    repeat: false,
+                    ..
+                } if *key != Key::Escape => Some(*key),
+                _ => None,
+            });
+            (esc, key)
+        });
+
+        match self.listening {
+            Listening::Key(button) => {
+                if esc {
+                    self.listening = Listening::None;
+                } else if let Some(key) = captured_key {
+                    self.rebind_key(button, key);
+                    self.listening = Listening::None;
+                    self.sync_prev_pad(ctx);
+                }
+                return;
+            }
+            Listening::Pad(button) => {
+                if esc {
+                    self.listening = Listening::None;
+                } else if let Some(button_input) = captured_pad {
+                    self.rebind_pad(button, button_input);
+                    self.listening = Listening::None;
+                    self.sync_prev_pad(ctx);
+                }
+                return;
+            }
+            Listening::None => {}
+        }
+
+        if esc || back_btn {
+            match self.screen {
+                Screen::Settings => {
+                    self.screen = Screen::Library;
+                    return;
+                }
+                Screen::Browser
+                    if self.config.rom_dir.as_ref().is_some_and(|d| d.is_dir()) =>
+                {
+                    self.screen = self.browser_from;
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        match self.screen {
+            Screen::Library => {
+                if menu_btn {
+                    self.settings_focus = 0;
+                    self.settings_scroll = true;
+                    self.screen = Screen::Settings;
+                    return;
+                }
+                let count = self.scan.entries().len();
+                if count > 0 {
+                    if down {
+                        self.sel = (self.sel + 1) % count;
+                    } else if up {
+                        self.sel = (self.sel + count - 1) % count;
+                    }
+                    if select {
+                        if let Some(entry) = self.scan.entries().get(self.sel).cloned() {
+                            self.launch(entry);
+                        }
+                    }
+                }
+            }
+            Screen::Settings => {
+                if menu_btn {
+                    self.screen = Screen::Library;
+                    return;
+                }
+                self.navigate_settings(up, down, left, right, select);
+            }
+            _ => {}
+        }
+    }
+
+    fn navigate_settings(&mut self, up: bool, down: bool, left: bool, right: bool, select: bool) {
+        let items = settings_items();
+        if self.settings_focus >= items.len() {
+            self.settings_focus = 0;
+        }
+        let cur = items[self.settings_focus];
+
+        if let Some(target) = focus_move(cur, up, down, left, right) {
+            if let Some(idx) = items.iter().position(|it| *it == target) {
+                self.settings_focus = idx;
+                self.settings_scroll = true;
+            }
+            return;
+        }
+
+        match cur {
+            SetItem::ChangeFolder => {
+                if select {
+                    self.open_browser(Screen::Settings);
+                }
+            }
+            SetItem::Device => {
+                let count = self
+                    .gilrs
+                    .as_ref()
+                    .map(|g| g.gamepads().count())
+                    .unwrap_or(0);
+                if count > 0 {
+                    if right {
+                        self.device_idx = (self.device_idx + 1) % count;
+                    } else if left {
+                        self.device_idx = (self.device_idx + count - 1) % count;
+                    }
+                }
+            }
+            SetItem::Map(button, is_gamepad) => {
+                if select {
+                    self.listening = if is_gamepad {
+                        Listening::Pad(button)
+                    } else {
+                        Listening::Key(button)
+                    };
+                }
+            }
+            SetItem::Palette => {
+                let all = PaletteKind::ALL;
+                let cur = all.iter().position(|p| *p == self.config.palette).unwrap_or(0);
+                if right || select {
+                    self.config.palette = all[(cur + 1) % all.len()];
+                } else if left {
+                    self.config.palette = all[(cur + all.len() - 1) % all.len()];
+                }
+            }
+            SetItem::Shader(i) => {
+                let s = &mut self.config.shaders;
+                let flip = select || left || right;
+                let adjust = |v: &mut f32| {
+                    let step = if left { -0.05 } else { 0.05 };
+                    if left || right || select {
+                        *v = (*v + step).clamp(0.0, 1.0);
+                    }
+                };
+                match i {
+                    0 if flip => s.color_correct = !s.color_correct,
+                    1 => adjust(&mut s.gamma_weight),
+                    2 if flip => s.ghosting = !s.ghosting,
+                    3 => adjust(&mut s.response_time),
+                    4 if flip && !s.integer_scale => s.pixel_aa = !s.pixel_aa,
+                    5 if flip => s.integer_scale = !s.integer_scale,
+                    6 if flip => s.lcd_grid = !s.lcd_grid,
+                    7 => adjust(&mut s.grid_intensity),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    fn sync_prev_pad(&mut self, ctx: &egui::Context) {
+        self.prev_pad = ctx.input(|i| read_joypad_state(i, self.gilrs.as_mut(), &self.controls));
+    }
+
+    fn rebind_key(&mut self, button: JoypadButton, key: Key) {
+        if let Some(control) = self.controls.iter_mut().find(|c| c.button == button) {
+            match control
+                .inputs
+                .iter_mut()
+                .find(|b| matches!(b, InputBinding::Keyboard(_)))
+            {
+                Some(slot) => *slot = InputBinding::Keyboard(key),
+                None => control.inputs.push(InputBinding::Keyboard(key)),
+            }
+        }
+    }
+
+    fn rebind_pad(&mut self, button: JoypadButton, pad_button: Button) {
+        if let Some(control) = self.controls.iter_mut().find(|c| c.button == button) {
+            match control
+                .inputs
+                .iter_mut()
+                .find(|b| matches!(b, InputBinding::GamepadButton(_)))
+            {
+                Some(slot) => *slot = InputBinding::GamepadButton(pad_button),
+                None => control.inputs.push(InputBinding::GamepadButton(pad_button)),
+            }
+        }
+    }
+
+
+    fn titlebar(&mut self, ui: &mut egui::Ui, pal: Palette) {
+        let frame = egui::Frame::default()
+            .fill(pal.bg2)
+            .inner_margin(Margin::symmetric(15, 8));
+
+        let mut go_settings = false;
+
+        let bar = egui::Panel::top("titlebar")
+            .frame(frame)
+            .show_separator_line(false)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    if let Some(texture) = &self.texture {
-                        let h = 54.0;
-                        let w = h * SCREEN_WIDTH as f32 / SCREEN_HEIGHT as f32;
-                        ui.image(SizedTexture::new(texture.id(), vec2(w, h)));
+                    ui.label(RichText::new("Cheddy GB").font(theme::silk(12.0)).color(pal.scr));
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new("DOT MATRIX WITH STEREO SOUND")
+                            .font(theme::silk(9.0))
+                            .color(pal.scr3),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let gear_color = if self.screen == Screen::Settings {
+                            pal.acc
+                        } else {
+                            pal.scr2
+                        };
+                        if icon_button(ui, gear_color, pal.acc, draw_gear).clicked() {
+                            go_settings = true;
+                        }
+                    });
+                });
+            });
+
+        let rect = bar.response.rect;
+        ui.painter()
+            .hline(rect.x_range(), rect.bottom(), Stroke::new(1.0, pal.line));
+
+        if go_settings {
+            self.screen = if self.screen == Screen::Settings {
+                Screen::Library
+            } else {
+                Screen::Settings
+            };
+        }
+    }
+
+
+    fn ui_boot(&mut self, ui: &mut egui::Ui, pal: Palette) {
+        let elapsed = self
+            .boot_started
+            .map(|s| s.elapsed())
+            .unwrap_or(BOOT_DURATION);
+        if elapsed >= BOOT_DURATION {
+            self.after_boot();
+            return;
+        }
+        ui.ctx().request_repaint();
+
+        let t = elapsed.as_secs_f32();
+        let drop = (t / 0.9).clamp(0.0, 1.0);
+        let ease = 1.0 - (1.0 - drop).powi(3);
+        let y_off = -180.0 * (1.0 - ease);
+        let alpha = ((t / 0.4).clamp(0.0, 1.0) * 255.0) as u8;
+
+        let rect = ui.max_rect();
+        let painter = ui.painter();
+        let center = rect.center();
+
+        let logo_color = with_alpha(pal.scr, alpha);
+        painter.text(
+            pos2(center.x, center.y + y_off),
+            Align2::CENTER_CENTER,
+            "CheddyGB",
+            theme::pixel(30.0),
+            logo_color,
+        );
+        if t > 1.75 {
+            painter.text(
+                pos2(center.x, center.y + 60.0),
+                Align2::CENTER_CENTER,
+                "\u{2122}",
+                theme::silk(12.0),
+                pal.scr3,
+            );
+        }
+
+        if t < 0.25 {
+            let flash = (0.25 - t) / 0.25 * 0.45;
+            painter.rect_filled(
+                rect,
+                CornerRadius::ZERO,
+                Color32::from_white_alpha((flash * 255.0) as u8),
+            );
+        }
+    }
+
+
+    fn ui_library(&mut self, ui: &mut egui::Ui, pal: Palette) {
+        self.poll_scan(&ui.ctx().clone());
+        paint_dot_grid(ui, pal);
+
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.add_space(4.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(
+                        RichText::new("GAME BOY")
+                            .font(theme::pixel(24.0))
+                            .color(pal.scr),
+                    );
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new("\u{25AA} SELECT A GAME")
+                            .font(theme::silk(10.0))
+                            .color(pal.scr3),
+                    );
+                });
+                ui.add_space(18.0);
+
+                let mut launch = None;
+                let mut resume = false;
+                let mut stop = false;
+
+                if self.session.is_some() {
+                    self.continue_card(ui, pal, &mut resume, &mut stop);
+                    ui.add_space(18.0);
+                }
+
+                match &self.scan {
+                    ScanState::Scanning(_) | ScanState::Idle => {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(RichText::new("SCANNING\u{2026}").color(pal.scr2));
+                        });
                     }
+                    ScanState::Error(err) => {
+                        ui.colored_label(ERROR_COLOR, err.clone());
+                    }
+                    ScanState::Ready(entries) if entries.is_empty() => {
+                        ui.label(RichText::new("NO ROMS FOUND").color(pal.scr2));
+                        ui.add_space(8.0);
+                        if text_button(ui, "CHANGE FOLDER", theme::silk(9.0), pal.scr, pal.bg)
+                            .clicked()
+                        {
+                            self.open_browser(Screen::Library);
+                        }
+                    }
+                    ScanState::Ready(entries) => {
+                        for (i, entry) in entries.iter().enumerate() {
+                            let resp = menu_row(ui, pal, entry, i == self.sel);
+                            if resp.clicked() {
+                                self.sel = i;
+                            }
+                            if resp.double_clicked() {
+                                launch = Some(entry.clone());
+                            }
+                        }
+                    }
+                }
+
+                if let Some(err) = &self.error {
+                    ui.add_space(8.0);
+                    ui.colored_label(ERROR_COLOR, err);
+                }
+
+                if let Some(entry) = launch {
+                    self.launch(entry);
+                } else if resume {
+                    self.resume();
+                } else if stop {
+                    self.stop();
+                }
+            });
+    }
+
+    fn continue_card(
+        &self,
+        ui: &mut egui::Ui,
+        pal: Palette,
+        resume: &mut bool,
+        stop: &mut bool,
+    ) {
+        egui::Frame::default()
+            .fill(pal.tint(10))
+            .stroke(Stroke::new(2.0, pal.scr))
+            .corner_radius(CornerRadius::same(5))
+            .inner_margin(Margin::symmetric(18, 15))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let thumb = vec2(56.0, 52.0);
+                    let (trect, _) = ui.allocate_exact_size(thumb, Sense::hover());
+                    if let Some(texture) = &self.texture {
+                        egui::Image::new(SizedTexture::new(texture.id(), thumb)).paint_at(ui, trect);
+                    } else {
+                        ui.painter()
+                            .rect_filled(trect, CornerRadius::same(2), pal.scr);
+                    }
+
                     ui.add_space(6.0);
                     ui.vertical(|ui| {
                         ui.label(
-                            RichText::new("NOW PLAYING")
-                                .color(theme::GREEN)
-                                .small()
-                                .strong(),
+                            RichText::new("\u{25B6} CONTINUE")
+                                .font(theme::pixel(9.0))
+                                .color(pal.acc),
                         );
+                        ui.add_space(6.0);
                         let title = self
                             .current
                             .as_ref()
-                            .map(|entry| entry.display_title())
+                            .map(|e| e.display_title().to_uppercase())
+                            .unwrap_or_default();
+                        ui.label(RichText::new(title).font(theme::mono(17.0)).color(pal.scr));
+                        ui.add_space(2.0);
+                        let mapper = self
+                            .current
+                            .as_ref()
+                            .map(|e| e.mapper.as_str())
                             .unwrap_or("");
-                        ui.label(RichText::new(title).size(17.0).strong());
-                        ui.label(RichText::new("Paused").color(theme::WEAK).small());
+                        ui.label(
+                            RichText::new(format!(
+                                "PAUSED \u{2014} {} \u{00B7} {}",
+                                format_duration(self.total_playtime()),
+                                mapper
+                            ))
+                            .font(theme::mono(12.5))
+                            .color(pal.scr2),
+                        );
                     });
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("■  Stop").clicked() {
-                            actions.stop = true;
+
+                    ui.with_layout(Layout::top_down(Align::Max), |ui| {
+                        if text_button(ui, "\u{25B6} RESUME", theme::pixel(9.0), pal.scr, pal.bg)
+                            .clicked()
+                        {
+                            *resume = true;
                         }
-                        let resume = egui::Button::new(
-                            RichText::new("▶  Resume").strong().color(theme::WINDOW_BG),
-                        )
-                        .fill(theme::GREEN)
-                        .min_size(vec2(0.0, 32.0));
-                        if ui.add(resume).clicked() {
-                            actions.resume = true;
+                        ui.add_space(2.0);
+                        if ghost_button(ui, "STOP", theme::pixel(9.0), pal).clicked() {
+                            *stop = true;
                         }
                     });
                 });
             });
     }
 
-    fn ui_playing(&mut self, ui: &mut egui::Ui) {
+
+    fn ui_settings(&mut self, ui: &mut egui::Ui, pal: Palette) {
+        self.poll_scan(&ui.ctx().clone());
+        paint_dot_grid(ui, pal);
+
+        let items = settings_items();
+        let focused = items[self.settings_focus.min(items.len() - 1)];
+        let scroll = self.settings_scroll;
+        let mut open_browser = false;
+
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    if icon_button(ui, pal.scr, pal.acc, draw_back).clicked() {
+                        self.screen = Screen::Library;
+                    }
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new("OPTIONS")
+                            .font(theme::pixel(16.0))
+                            .color(pal.scr),
+                    );
+                });
+                ui.add_space(20.0);
+
+                section_label(ui, pal, "ROM FOLDER");
+                egui::Frame::default()
+                    .stroke(Stroke::new(2.0, pal.line))
+                    .corner_radius(CornerRadius::same(4))
+                    .inner_margin(Margin::symmetric(15, 11))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let path = self
+                                .config
+                                .rom_dir
+                                .as_ref()
+                                .map(|d| d.display().to_string())
+                                .unwrap_or_else(|| "(not set)".into());
+                            ui.label(
+                                RichText::new(shorten(&path, 34))
+                                    .font(theme::mono(13.0))
+                                    .color(pal.scr),
+                            );
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                let change =
+                                    text_button(ui, "CHANGE", theme::silk(9.0), pal.scr, pal.bg);
+                                if change.clicked() {
+                                    open_browser = true;
+                                }
+                                if focused == SetItem::ChangeFolder {
+                                    focus_ring(ui, change.rect, pal, scroll);
+                                }
+                            });
+                        });
+                        ui.add_space(6.0);
+                        ui.label(
+                            RichText::new(format!("{} ROMS", self.scan.entries().len()))
+                                .font(theme::mono(11.0))
+                                .color(pal.scr3),
+                        );
+                    });
+                ui.add_space(22.0);
+
+                section_label(ui, pal, "CONTROLLER");
+                self.controller_box(ui, pal, focused == SetItem::Device, scroll);
+                ui.add_space(10.0);
+                self.mapping_box(ui, pal, focused, scroll);
+                ui.add_space(22.0);
+
+                section_label(ui, pal, "SCREEN");
+                self.shaders_box(ui, pal, focused, scroll);
+                ui.add_space(8.0);
+            });
+
+        self.settings_scroll = false;
+        if open_browser {
+            self.open_browser(Screen::Settings);
+        }
+    }
+
+    fn controller_box(&mut self, ui: &mut egui::Ui, pal: Palette, focused: bool, scroll: bool) {
+        let devices: Vec<String> = self
+            .gilrs
+            .as_ref()
+            .map(|g| g.gamepads().map(|(_, gp)| gp.name().to_uppercase()).collect())
+            .unwrap_or_default();
+        let has_pad = !devices.is_empty();
+        if has_pad {
+            self.device_idx %= devices.len();
+        }
+        let name = if has_pad {
+            devices[self.device_idx].clone()
+        } else {
+            "KEYBOARD ONLY".to_string()
+        };
+
+        let border = if focused { pal.acc } else { pal.line };
+        egui::Frame::default()
+            .stroke(Stroke::new(2.0, border))
+            .corner_radius(CornerRadius::same(4))
+            .inner_margin(Margin::symmetric(14, 6))
+            .show(ui, |ui| {
+                let (rect, _) =
+                    ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::hover());
+                if focused && scroll {
+                    ui.scroll_to_rect(rect, Some(Align::Center));
+                }
+                let left = Rect::from_min_size(rect.left_top(), vec2(30.0, rect.height()));
+                let right = Rect::from_min_size(
+                    pos2(rect.right() - 30.0, rect.top()),
+                    vec2(30.0, rect.height()),
+                );
+
+                let prev = ui.interact(left, ui.id().with("dev_prev"), Sense::click());
+                let next = ui.interact(right, ui.id().with("dev_next"), Sense::click());
+
+                let painter = ui.painter();
+                painter.text(
+                    left.center(),
+                    Align2::CENTER_CENTER,
+                    "\u{25C0}",
+                    theme::mono(15.0),
+                    pal.acc,
+                );
+                painter.text(
+                    right.center(),
+                    Align2::CENTER_CENTER,
+                    "\u{25B6}",
+                    theme::mono(15.0),
+                    pal.acc,
+                );
+                let name_pos = pos2(rect.center().x - 8.0, rect.center().y);
+                let galley = painter.text(
+                    name_pos,
+                    Align2::CENTER_CENTER,
+                    &name,
+                    theme::mono(14.0),
+                    pal.scr,
+                );
+                let dot_color = if has_pad { pal.scr } else { pal.scr3 };
+                painter.circle_filled(
+                    pos2(galley.right() + 12.0, rect.center().y),
+                    3.5,
+                    dot_color,
+                );
+
+                if prev.clicked() && has_pad {
+                    self.device_idx = (self.device_idx + devices.len() - 1) % devices.len();
+                }
+                if next.clicked() && has_pad {
+                    self.device_idx = (self.device_idx + 1) % devices.len();
+                }
+            });
+    }
+
+    fn mapping_box(&mut self, ui: &mut egui::Ui, pal: Palette, focused: SetItem, scroll: bool) {
+        let rows = mappings(&self.controls);
+        let listening = self.listening;
+        let mut new_listening: Option<Listening> = None;
+
+        egui::Frame::default()
+            .stroke(Stroke::new(2.0, pal.line))
+            .corner_radius(CornerRadius::same(4))
+            .inner_margin(Margin::symmetric(15, 10))
+            .show(ui, |ui| {
+                let col_w = ((ui.available_width() - 32.0) / 3.0).max(1.0);
+                egui::Grid::new("mapping_grid")
+                    .num_columns(3)
+                    .spacing([16.0, 9.0])
+                    .min_col_width(col_w)
+                    .show(ui, |ui| {
+                        for h in ["BUTTON", "KEYBOARD", "GAMEPAD"] {
+                            ui.label(RichText::new(h).font(theme::silk(8.5)).color(pal.scr2));
+                        }
+                        ui.end_row();
+
+                        for m in &rows {
+                            ui.label(
+                                RichText::new(m.button).font(theme::mono(12.5)).color(pal.scr),
+                            );
+
+                            let key_on = listening == Listening::Key(m.id);
+                            let key_chip = rebind_chip(ui, pal, &m.keyboard, key_on);
+                            if focused == SetItem::Map(m.id, false) {
+                                focus_ring(ui, key_chip.rect, pal, scroll);
+                            }
+                            if key_chip.clicked() {
+                                new_listening = Some(toggle_listen(key_on, Listening::Key(m.id)));
+                            }
+
+                            let pad_on = listening == Listening::Pad(m.id);
+                            let pad_chip = rebind_chip(ui, pal, &m.gamepad, pad_on);
+                            if focused == SetItem::Map(m.id, true) {
+                                focus_ring(ui, pad_chip.rect, pal, scroll);
+                            }
+                            if pad_chip.clicked() {
+                                new_listening = Some(toggle_listen(pad_on, Listening::Pad(m.id)));
+                            }
+                            ui.end_row();
+                        }
+                    });
+            });
+
+        if let Some(next) = new_listening {
+            self.listening = next;
+        }
+    }
+
+    fn shaders_box(&mut self, ui: &mut egui::Ui, pal: Palette, focused: SetItem, scroll: bool) {
+        egui::Frame::default()
+            .stroke(Stroke::new(2.0, pal.line))
+            .corner_radius(CornerRadius::same(4))
+            .inner_margin(Margin::symmetric(16, 14))
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new("SCREEN PALETTE")
+                        .font(theme::mono(13.5))
+                        .color(pal.scr),
+                );
+                ui.add_space(11.0);
+                let row = ui.horizontal(|ui| {
+                    for kind in PaletteKind::ALL {
+                        if palette_swatch(ui, kind, self.config.palette == kind).clicked() {
+                            self.config.palette = kind;
+                        }
+                        ui.add_space(6.0);
+                    }
+                });
+                if focused == SetItem::Palette {
+                    focus_ring(ui, row.response.rect, pal, scroll);
+                }
+                ui.add_space(10.0);
+
+                let sh = &mut self.config.shaders;
+                let f = |i: usize| focused == SetItem::Shader(i);
+
+                shader_group(ui, pal, "COLOR & GAMMA");
+                toggle_row(ui, pal, "COLOR CORRECTION", &mut sh.color_correct, f(0), scroll);
+                slider_row(ui, pal, "GAMMA WEIGHT", &mut sh.gamma_weight, f(1), scroll);
+
+                shader_group(ui, pal, "GHOSTING");
+                toggle_row(ui, pal, "LCD GHOSTING", &mut sh.ghosting, f(2), scroll);
+                slider_row(ui, pal, "RESPONSE TIME", &mut sh.response_time, f(3), scroll);
+
+                shader_group(ui, pal, "SCALING");
+                let integer_on = sh.integer_scale;
+                toggle_row_enabled(
+                    ui, pal, "PIXEL AA", &mut sh.pixel_aa, f(4), scroll, !integer_on, "N/A",
+                );
+                toggle_row(ui, pal, "INTEGER SCALE", &mut sh.integer_scale, f(5), scroll);
+
+                shader_group(ui, pal, "LCD GRID");
+                toggle_row(ui, pal, "LCD GRID", &mut sh.lcd_grid, f(6), scroll);
+                slider_row(ui, pal, "GRID INTENSITY", &mut sh.grid_intensity, f(7), scroll);
+            });
+    }
+
+
+    fn ui_browser(&mut self, ui: &mut egui::Ui, pal: Palette) {
+        let can_cancel = self.config.rom_dir.as_ref().is_some_and(|d| d.is_dir());
+
+        ui.horizontal(|ui| {
+            if can_cancel && icon_button(ui, pal.scr, pal.acc, draw_back).clicked() {
+                self.screen = self.browser_from;
+            }
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new("ROM FOLDER")
+                    .font(theme::pixel(16.0))
+                    .color(pal.scr),
+            );
+        });
+        ui.add_space(14.0);
+
+        if let Some(dir) = self.browser.ui(ui) {
+            self.config.rom_dir = Some(dir.clone());
+            self.start_scan(dir);
+            self.screen = Screen::Library;
+        }
+    }
+
+
+    fn ui_playing(&mut self, ui: &mut egui::Ui, pal: Palette) {
         let ctx = ui.ctx().clone();
 
         if ctx.input(|i| i.key_pressed(Key::Escape)) {
@@ -346,8 +1102,8 @@ impl App {
             }
         }
 
-        self.upload_frame(&ctx);
-        self.draw_screen(ui);
+        self.upload_frame(&ctx, pal);
+        self.draw_screen(ui, pal);
 
         if has_audio {
             ctx.request_repaint_after(Duration::from_millis(1));
@@ -356,66 +1112,140 @@ impl App {
         }
     }
 
-    fn upload_frame(&mut self, ctx: &egui::Context) {
+    fn upload_frame(&mut self, ctx: &egui::Context, pal: Palette) {
         let Some(session) = self.session.as_ref() else {
             return;
         };
+        let tint = self.current.as_ref().is_some_and(|e| !e.color);
+
         for (pixel, out) in session
             .framebuffer()
             .iter()
             .zip(self.rgba.chunks_exact_mut(4))
         {
-            out[0] = (pixel >> 16) as u8;
-            out[1] = (pixel >> 8) as u8;
-            out[2] = *pixel as u8;
+            if tint {
+                let luma = (*pixel & 0xFF) as u8;
+                let color = pal.shade(luma);
+                out[0] = color.r();
+                out[1] = color.g();
+                out[2] = color.b();
+            } else {
+                out[0] = (pixel >> 16) as u8;
+                out[1] = (pixel >> 8) as u8;
+                out[2] = *pixel as u8;
+            }
             out[3] = 0xFF;
         }
 
         let image =
             egui::ColorImage::from_rgba_unmultiplied([SCREEN_WIDTH, SCREEN_HEIGHT], &self.rgba);
+        let options = egui::TextureOptions::NEAREST;
         match &mut self.texture {
-            Some(texture) => texture.set(image, egui::TextureOptions::NEAREST),
-            None => {
-                self.texture =
-                    Some(ctx.load_texture("gb_screen", image, egui::TextureOptions::NEAREST))
-            }
+            Some(texture) => texture.set(image, options),
+            None => self.texture = Some(ctx.load_texture("gb_screen", image, options)),
         }
     }
 
-    fn draw_screen(&self, ui: &mut egui::Ui) {
-        egui::CentralPanel::default()
-            .frame(egui::Frame::default().fill(Color32::BLACK))
-            .show(ui, |ui| {
-                let Some(texture) = &self.texture else {
-                    return;
-                };
-                let avail = ui.available_size();
-                let scale = (avail.x / SCREEN_WIDTH as f32)
-                    .min(avail.y / SCREEN_HEIGHT as f32)
-                    .max(0.0);
-                let size = vec2(SCREEN_WIDTH as f32 * scale, SCREEN_HEIGHT as f32 * scale);
-                let (rect, _) = ui.allocate_exact_size(avail, Sense::hover());
-                let image_rect = egui::Rect::from_center_size(rect.center(), size);
-                egui::Image::new(SizedTexture::new(texture.id(), size)).paint_at(ui, image_rect);
+    fn draw_screen(&self, ui: &mut egui::Ui, _pal: Palette) {
+        let avail = ui.available_size();
+        let (area, _) = ui.allocate_exact_size(avail, Sense::hover());
 
-                ui.painter().text(
-                    pos2(rect.center().x, rect.bottom() - 10.0),
-                    Align2::CENTER_BOTTOM,
-                    "Esc — library",
-                    FontId::proportional(12.0),
-                    Color32::from_white_alpha(70),
-                );
-            });
+        let aspect = SCREEN_WIDTH as f32 / SCREEN_HEIGHT as f32;
+        let mut w = avail.x.min(avail.y * aspect);
+        let mut h = w / aspect;
+        if self.config.shaders.integer_scale {
+            let scale = (h / SCREEN_HEIGHT as f32).floor().max(1.0);
+            w = SCREEN_WIDTH as f32 * scale;
+            h = SCREEN_HEIGHT as f32 * scale;
+        }
+        let rect = Rect::from_center_size(area.center(), vec2(w, h));
+        if rect.width() < 1.0 || rect.height() < 1.0 {
+            return;
+        }
+
+        let s = &self.config.shaders;
+        let params = ShaderParams {
+            color_correct: s.color_correct,
+            gamma_weight: s.gamma_weight,
+            ghosting: s.ghosting,
+            response_time: s.response_time,
+            pixel_aa: s.pixel_aa,
+            lcd_grid: s.lcd_grid,
+            grid_intensity: s.grid_intensity,
+        };
+        let rgba = self.rgba.clone();
+        let pipeline = self.pipeline.clone();
+        let callback = egui::PaintCallback {
+            rect,
+            callback: Arc::new(egui_glow::CallbackFn::new(move |info, painter| {
+                let gl = painter.gl();
+                let mut guard = pipeline.lock().unwrap();
+                if guard.is_none() {
+                    match Pipeline::new(gl) {
+                        Ok(p) => *guard = Some(p),
+                        Err(err) => {
+                            eprintln!("failed to build shader pipeline: {err}");
+                            return;
+                        }
+                    }
+                }
+                if let Some(p) = guard.as_mut() {
+                    p.render(gl, &rgba, &params, &info);
+                }
+            })),
+        };
+        ui.painter().add(callback);
     }
 }
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        match self.screen {
-            Screen::SetupRomDir => self.ui_setup(ui),
-            Screen::Menu => self.ui_menu(ui),
-            Screen::Playing => self.ui_playing(ui),
+        let ctx = ui.ctx().clone();
+
+        let mut captured_pad: Option<Button> = None;
+        if let Some(gilrs) = self.gilrs.as_mut() {
+            while let Some(ev) = gilrs.next_event() {
+                if let EventType::ButtonPressed(button, _) = ev.event {
+                    captured_pad.get_or_insert(button);
+                }
+            }
         }
+
+        let pal = self.palette();
+        theme::style(&ctx, pal);
+
+        if self.screen == Screen::Playing {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::default().fill(pal.bg))
+                .show(ui, |ui| self.ui_playing(ui, pal));
+            return;
+        }
+
+        self.handle_menu_input(&ctx, captured_pad);
+
+        if self.screen == Screen::Playing {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::default().fill(pal.bg))
+                .show(ui, |ui| self.ui_playing(ui, pal));
+            return;
+        }
+
+        ctx.request_repaint_after(Duration::from_millis(33));
+
+        self.titlebar(ui, pal);
+
+        let frame = egui::Frame::default()
+            .fill(pal.bg)
+            .inner_margin(Margin::symmetric(30, 22));
+        egui::CentralPanel::default()
+            .frame(frame)
+            .show(ui, |ui| match self.screen {
+                Screen::Boot => self.ui_boot(ui, pal),
+                Screen::Library => self.ui_library(ui, pal),
+                Screen::Settings => self.ui_settings(ui, pal),
+                Screen::Browser => self.ui_browser(ui, pal),
+                Screen::Playing => {}
+            });
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
@@ -429,57 +1259,352 @@ impl eframe::App for App {
     }
 }
 
-fn rom_row(ui: &mut egui::Ui, entry: &RomEntry, is_current: bool) -> egui::Response {
-    let height = 56.0;
-    let (rect, response) =
-        ui.allocate_at_least(vec2(ui.available_width(), height), Sense::click());
-    let hovered = response.hovered();
 
-    let fill = if is_current {
-        theme::GREEN_TINT
+fn text_button(
+    ui: &mut egui::Ui,
+    label: &str,
+    font: FontId,
+    fill: Color32,
+    text_color: Color32,
+) -> egui::Response {
+    let galley = ui.painter().layout_no_wrap(label.to_string(), font, text_color);
+    let pad = vec2(13.0, 9.0);
+    let (rect, resp) = ui.allocate_at_least(galley.size() + pad * 2.0, Sense::click());
+    let bg = if resp.hovered() { lighten(fill, 0.12) } else { fill };
+    ui.painter().rect_filled(rect, CornerRadius::same(3), bg);
+    ui.painter()
+        .galley(rect.center() - galley.size() / 2.0, galley, text_color);
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+fn ghost_button(ui: &mut egui::Ui, label: &str, font: FontId, pal: Palette) -> egui::Response {
+    let galley = ui.painter().layout_no_wrap(label.to_string(), font, pal.scr);
+    let pad = vec2(13.0, 8.0);
+    let (rect, resp) = ui.allocate_at_least(galley.size() + pad * 2.0, Sense::click());
+    let stroke = if resp.hovered() { pal.scr } else { pal.line };
+    ui.painter()
+        .rect_stroke(rect, CornerRadius::same(3), Stroke::new(2.0, stroke), StrokeKind::Inside);
+    ui.painter()
+        .galley(rect.center() - galley.size() / 2.0, galley, pal.scr);
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+fn menu_row(ui: &mut egui::Ui, pal: Palette, entry: &RomEntry, selected: bool) -> egui::Response {
+    let height = 46.0;
+    let (rect, resp) = ui.allocate_at_least(vec2(ui.available_width(), height), Sense::click());
+    let hovered = resp.hovered();
+
+    let (bg, fg, badge_col) = if selected {
+        (pal.scr, pal.bg, pal.bg)
     } else if hovered {
-        theme::CARD_HOVER
+        (pal.tint(22), pal.scr, pal.scr2)
     } else {
-        theme::CARD
+        (Color32::TRANSPARENT, pal.scr, pal.scr2)
     };
 
     let painter = ui.painter();
-    let radius = CornerRadius::same(10);
-    painter.rect_filled(rect, radius, fill);
-    if is_current {
-        painter.rect_stroke(rect, radius, Stroke::new(1.0, theme::GREEN), StrokeKind::Inside);
-    } else if hovered {
-        painter.rect_stroke(rect, radius, Stroke::new(1.0, theme::STROKE), StrokeKind::Inside);
-    }
+    painter.rect_filled(rect, CornerRadius::same(3), bg);
 
     let pad = 16.0;
     painter.text(
-        pos2(rect.left() + pad, rect.top() + 11.0),
-        Align2::LEFT_TOP,
-        entry.display_title(),
-        FontId::proportional(16.0),
-        theme::TEXT,
+        pos2(rect.left() + pad, rect.center().y),
+        Align2::LEFT_CENTER,
+        if selected { "\u{25BA}" } else { " " },
+        theme::mono(14.0),
+        fg,
     );
     painter.text(
-        pos2(rect.left() + pad, rect.top() + 33.0),
-        Align2::LEFT_TOP,
-        format!("{}  ·  {}", entry.mapper, entry.file_name),
-        FontId::proportional(12.0),
-        theme::WEAK,
+        pos2(rect.left() + pad + 26.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        entry.display_title().to_uppercase(),
+        theme::mono(16.0),
+        fg,
     );
-
-    let (badge, badge_color) = if entry.color {
-        ("GBC", theme::PURPLE)
-    } else {
-        ("GB", theme::GREEN)
-    };
+    let badge = if entry.color { "GBC" } else { "GB" };
     painter.text(
         pos2(rect.right() - pad, rect.center().y),
         Align2::RIGHT_CENTER,
         badge,
-        FontId::proportional(13.0),
-        badge_color,
+        theme::silk(9.0),
+        badge_col,
     );
 
-    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+fn rebind_chip(ui: &mut egui::Ui, pal: Palette, text: &str, listening: bool) -> egui::Response {
+    let (label, fg, border) = if listening {
+        ("PRESS\u{2026}".to_string(), pal.bg, pal.acc)
+    } else {
+        (text.to_string(), pal.acc, pal.line)
+    };
+    let fill = if listening { pal.acc } else { pal.tint(16) };
+    let galley = ui.painter().layout_no_wrap(label, theme::mono(11.0), fg);
+    let pad = vec2(8.0, 4.0);
+    let (rect, resp) = ui.allocate_at_least(galley.size() + pad * 2.0, Sense::click());
+    let stroke = if resp.hovered() { pal.scr } else { border };
+    ui.painter().rect_filled(rect, CornerRadius::same(3), fill);
+    ui.painter().rect_stroke(
+        rect,
+        CornerRadius::same(3),
+        Stroke::new(1.0, stroke),
+        StrokeKind::Inside,
+    );
+    ui.painter()
+        .galley(rect.center() - galley.size() / 2.0, galley, fg);
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+fn toggle_listen(active: bool, target: Listening) -> Listening {
+    if active {
+        Listening::None
+    } else {
+        target
+    }
+}
+
+fn palette_swatch(ui: &mut egui::Ui, kind: PaletteKind, active: bool) -> egui::Response {
+    let pal = kind.palette();
+    let (rect, resp) = ui.allocate_exact_size(vec2(42.0, 42.0), Sense::click());
+    let painter = ui.painter();
+    painter.rect_filled(rect, CornerRadius::same(3), pal.sw2);
+    painter.add(Shape::convex_polygon(
+        vec![rect.left_top(), rect.right_top(), rect.left_bottom()],
+        pal.sw1,
+        Stroke::NONE,
+    ));
+    if active {
+        painter.rect_stroke(
+            rect.expand(2.0),
+            CornerRadius::same(4),
+            Stroke::new(2.0, pal.sw1),
+            StrokeKind::Outside,
+        );
+    }
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(kind.label())
+}
+
+fn toggle_row(
+    ui: &mut egui::Ui,
+    pal: Palette,
+    label: &str,
+    value: &mut bool,
+    focused: bool,
+    scroll: bool,
+) {
+    toggle_row_enabled(ui, pal, label, value, focused, scroll, true, "OFF");
+}
+
+#[allow(clippy::too_many_arguments)]
+fn toggle_row_enabled(
+    ui: &mut egui::Ui,
+    pal: Palette,
+    label: &str,
+    value: &mut bool,
+    focused: bool,
+    scroll: bool,
+    enabled: bool,
+    off_text: &str,
+) {
+    let sense = if enabled { Sense::click() } else { Sense::hover() };
+    let (rect, resp) = ui.allocate_at_least(vec2(ui.available_width(), 34.0), sense);
+    if enabled && resp.clicked() {
+        *value = !*value;
+    }
+    if focused && scroll {
+        ui.scroll_to_rect(rect, Some(Align::Center));
+    }
+    let painter = ui.painter();
+    if focused {
+        painter.rect_filled(rect, CornerRadius::same(3), pal.tint(20));
+    }
+    painter.hline(rect.x_range(), rect.top(), Stroke::new(1.0, pal.line));
+    let label_color = if !enabled {
+        pal.scr3
+    } else if focused {
+        pal.acc
+    } else {
+        pal.scr
+    };
+    painter.text(
+        pos2(rect.left() + 4.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        label,
+        theme::mono(13.5),
+        label_color,
+    );
+    let (state, color) = if !enabled {
+        (off_text, pal.scr3)
+    } else if *value {
+        ("\u{25BA} ON", pal.acc)
+    } else {
+        ("OFF", pal.scr3)
+    };
+    painter.text(
+        pos2(rect.right() - 4.0, rect.center().y),
+        Align2::RIGHT_CENTER,
+        state,
+        theme::mono(13.5),
+        color,
+    );
+    if enabled {
+        resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+    }
+}
+
+fn shader_group(ui: &mut egui::Ui, pal: Palette, text: &str) {
+    ui.add_space(8.0);
+    ui.label(RichText::new(text).font(theme::silk(8.5)).color(pal.scr2));
+}
+
+fn slider_row(
+    ui: &mut egui::Ui,
+    pal: Palette,
+    label: &str,
+    value: &mut f32,
+    focused: bool,
+    scroll: bool,
+) {
+    let (rect, resp) =
+        ui.allocate_at_least(vec2(ui.available_width(), 34.0), Sense::click_and_drag());
+    if focused && scroll {
+        ui.scroll_to_rect(rect, Some(Align::Center));
+    }
+
+    let track_w = 120.0;
+    let track = Rect::from_center_size(
+        pos2(rect.right() - track_w * 0.5 - 44.0, rect.center().y),
+        vec2(track_w, 5.0),
+    );
+    if resp.clicked() || resp.dragged() {
+        if let Some(pos) = resp.interact_pointer_pos() {
+            *value = ((pos.x - track.left()) / track.width()).clamp(0.0, 1.0);
+        }
+    }
+    let t = value.clamp(0.0, 1.0);
+
+    let painter = ui.painter();
+    if focused {
+        painter.rect_filled(rect, CornerRadius::same(3), pal.tint(20));
+    }
+    painter.hline(rect.x_range(), rect.top(), Stroke::new(1.0, pal.line));
+    let label_color = if focused { pal.acc } else { pal.scr };
+    painter.text(
+        pos2(rect.left() + 4.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        label,
+        theme::mono(13.5),
+        label_color,
+    );
+    painter.rect_filled(track, CornerRadius::same(3), pal.tint(30));
+    let fill = Rect::from_min_size(track.min, vec2(track.width() * t, track.height()));
+    painter.rect_filled(fill, CornerRadius::same(3), pal.acc);
+    painter.circle_filled(pos2(track.left() + track.width() * t, track.center().y), 5.0, pal.scr);
+    painter.text(
+        pos2(rect.right() - 4.0, rect.center().y),
+        Align2::RIGHT_CENTER,
+        format!("{:.0}%", t * 100.0),
+        theme::mono(12.0),
+        if focused { pal.acc } else { pal.scr2 },
+    );
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+}
+
+fn focus_ring(ui: &mut egui::Ui, rect: Rect, pal: Palette, scroll: bool) {
+    ui.painter().rect_stroke(
+        rect.expand(3.0),
+        CornerRadius::same(4),
+        Stroke::new(2.0, pal.acc),
+        StrokeKind::Outside,
+    );
+    if scroll {
+        ui.scroll_to_rect(rect.expand(24.0), Some(Align::Center));
+    }
+}
+
+fn section_label(ui: &mut egui::Ui, pal: Palette, text: &str) {
+    ui.label(
+        RichText::new(format!("\u{25AA} {text}"))
+            .font(theme::silk(10.0))
+            .color(pal.scr2),
+    );
+    ui.add_space(8.0);
+}
+
+fn icon_button(
+    ui: &mut egui::Ui,
+    color: Color32,
+    hover: Color32,
+    draw: impl FnOnce(&egui::Painter, Rect, Color32),
+) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(vec2(28.0, 28.0), Sense::click());
+    let c = if resp.hovered() { hover } else { color };
+    draw(ui.painter(), rect, c);
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+fn draw_gear(p: &egui::Painter, r: Rect, c: Color32) {
+    let center = r.center();
+    let rad = r.width() * 0.24;
+    let stroke = Stroke::new(1.7, c);
+    p.circle_stroke(center, rad, stroke);
+    p.circle_filled(center, rad * 0.42, c);
+    for i in 0..8 {
+        let a = std::f32::consts::TAU * i as f32 / 8.0;
+        let dir = vec2(a.cos(), a.sin());
+        p.line_segment([center + dir * rad, center + dir * (rad + 3.0)], stroke);
+    }
+}
+
+fn draw_back(p: &egui::Painter, r: Rect, c: Color32) {
+    let stroke = Stroke::new(2.0, c);
+    let cx = r.center().x + 2.0;
+    let cy = r.center().y;
+    let w = 5.0;
+    let h = 6.0;
+    p.line_segment([pos2(cx + w, cy - h), pos2(cx - w, cy)], stroke);
+    p.line_segment([pos2(cx - w, cy), pos2(cx + w, cy + h)], stroke);
+}
+
+fn paint_dot_grid(ui: &egui::Ui, pal: Palette) {
+    let rect = ui.clip_rect();
+    let painter = ui.painter();
+    let color = pal.dot();
+    let step = 12.0;
+    let mut x = rect.left();
+    while x <= rect.right() {
+        painter.vline(x, rect.y_range(), Stroke::new(1.0, color));
+        x += step;
+    }
+    let mut y = rect.top();
+    while y <= rect.bottom() {
+        painter.hline(rect.x_range(), y, Stroke::new(1.0, color));
+        y += step;
+    }
+}
+
+
+fn format_duration(d: Duration) -> String {
+    let s = d.as_secs();
+    format!("{:02}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60)
+}
+
+fn shorten(s: &str, max: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max {
+        s.to_string()
+    } else {
+        let tail: String = chars[chars.len() - (max - 1)..].iter().collect();
+        format!("\u{2026}{tail}")
+    }
+}
+
+fn with_alpha(c: Color32, a: u8) -> Color32 {
+    Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a)
+}
+
+fn lighten(c: Color32, t: f32) -> Color32 {
+    let mix = |x: u8| (x as f32 + (255.0 - x as f32) * t).round() as u8;
+    Color32::from_rgb(mix(c.r()), mix(c.g()), mix(c.b()))
 }
