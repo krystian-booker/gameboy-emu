@@ -1,4 +1,5 @@
 use crate::{
+    apu::{Apu, AudioSample},
     cartridge::Cartridge,
     error::{EmulatorError, Result},
     joypad::JoypadState,
@@ -29,9 +30,6 @@ const TIMA: u16 = 0xFF05;
 const TMA: u16 = 0xFF06;
 const TAC: u16 = 0xFF07;
 const INTERRUPT_FLAG: u16 = 0xFF0F;
-const NR14: u16 = 0xFF14;
-const NR24: u16 = 0xFF19;
-const NR52: u16 = 0xFF26;
 const DMA: u16 = 0xFF46;
 const KEY1: u16 = 0xFF4D;
 const HRAM_START: u16 = 0xFF80;
@@ -71,15 +69,6 @@ struct CgbState {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct ApuStub {
-    powered: bool,
-    channel1_active: bool,
-    channel1_cycles: u32,
-    channel2_active: bool,
-    channel2_cycles: u32,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct DmaState {
     source_high: u8,
     active: bool,
@@ -100,7 +89,7 @@ pub struct Bus {
     joypad: Joypad,
     serial: Serial,
     cgb: CgbState,
-    apu: ApuStub,
+    apu: Apu,
     dma: DmaState,
     ppu: Ppu,
 }
@@ -200,6 +189,10 @@ impl Bus {
         self.serial.drain_output()
     }
 
+    pub fn take_audio_samples(&mut self) -> Vec<AudioSample> {
+        self.apu.drain_samples()
+    }
+
     pub fn set_cgb_mode(&mut self, enabled: bool) {
         self.cgb.enabled = enabled;
         self.cgb.double_speed = false;
@@ -256,7 +249,11 @@ impl Bus {
             JOYPAD => Ok(self.joypad.read()),
             SERIAL_DATA => Ok(self.serial.read_data()),
             SERIAL_CONTROL => Ok(self.serial.read_control()),
-            NR52 => Ok(self.apu.read_nr52()),
+            0xFF10..=0xFF3F => self
+                .apu
+                .read_register(address)
+                .or_else(|| self.io.read((address - IO_START) as usize))
+                .ok_or(EmulatorError::InvalidMemoryAccess { address }),
             INTERRUPT_FLAG => Ok(self.interrupt_flag() | 0xE0),
             KEY1 => Ok(self.cgb.read_key1()),
             0xFF40..=0xFF4B => self
@@ -337,21 +334,13 @@ impl Bus {
                 }
                 true
             }
-            NR14 => {
-                self.apu.write_nr14(value, self.cgb.double_speed);
-                self.io.write((NR14 - IO_START) as usize, value)
-            }
-            NR24 => {
-                self.apu.write_nr24(value);
-                self.io.write((NR24 - IO_START) as usize, value)
-            }
-            NR52 => {
-                self.apu.write_nr52(value);
-                self.io.write((NR52 - IO_START) as usize, value)
-            }
             INTERRUPT_FLAG => self
                 .io
                 .write((INTERRUPT_FLAG - IO_START) as usize, value & 0x1F),
+            0xFF10..=0xFF3F => {
+                let _ = self.io.write((address - IO_START) as usize, value);
+                self.apu.write_register(address, value)
+            }
             DMA => {
                 let wrote = self.io.write((DMA - IO_START) as usize, value);
                 self.start_dma(value);
@@ -474,7 +463,11 @@ impl Bus {
             JOYPAD => self.joypad.read(),
             SERIAL_DATA => self.serial.read_data(),
             SERIAL_CONTROL => self.serial.read_control(),
-            NR52 => self.apu.read_nr52(),
+            0xFF10..=0xFF3F => self
+                .apu
+                .read_register(address)
+                .or_else(|| self.io.read((address - IO_START) as usize))
+                .unwrap_or(0xFF),
             INTERRUPT_FLAG => self.interrupt_flag() | 0xE0,
             KEY1 => self.cgb.read_key1(),
             0xFF40..=0xFF4B => self
@@ -541,56 +534,6 @@ impl CgbState {
         if self.enabled {
             self.prepare_speed_switch = value & 0x01 != 0;
         }
-    }
-}
-
-impl ApuStub {
-    fn advance_cycles(&mut self, cycles: u32) {
-        advance_channel(&mut self.channel1_active, &mut self.channel1_cycles, cycles);
-        advance_channel(&mut self.channel2_active, &mut self.channel2_cycles, cycles);
-    }
-
-    fn read_nr52(&self) -> u8 {
-        if !self.powered {
-            return 0;
-        }
-
-        0x80 | u8::from(self.channel1_active) | (u8::from(self.channel2_active) << 1)
-    }
-
-    fn write_nr14(&mut self, value: u8, double_speed: bool) {
-        if self.powered && value & 0x80 != 0 {
-            self.channel1_active = true;
-            self.channel1_cycles = if double_speed { 32_000 } else { 12_000 };
-        }
-    }
-
-    fn write_nr24(&mut self, value: u8) {
-        if self.powered && value & 0x80 != 0 {
-            self.channel2_active = true;
-            self.channel2_cycles = 2_048;
-        }
-    }
-
-    fn write_nr52(&mut self, value: u8) {
-        self.powered = value & 0x80 != 0;
-        if !self.powered {
-            self.channel1_active = false;
-            self.channel1_cycles = 0;
-            self.channel2_active = false;
-            self.channel2_cycles = 0;
-        }
-    }
-}
-
-fn advance_channel(active: &mut bool, cycles_left: &mut u32, cycles: u32) {
-    if !*active {
-        return;
-    }
-
-    *cycles_left = cycles_left.saturating_sub(cycles);
-    if *cycles_left == 0 {
-        *active = false;
     }
 }
 
@@ -734,6 +677,34 @@ mod tests {
         assert_eq!(bus.read_byte(SERIAL_CONTROL), Ok(0xFE));
         assert_eq!(bus.read_byte(INTERRUPT_FLAG), Ok(0xE0));
         assert!(bus.take_serial_output().is_empty());
+    }
+
+    #[test]
+    fn apu_registers_are_memory_mapped_and_generate_samples() {
+        let mut bus = Bus::default();
+
+        assert_eq!(bus.read_byte(0xFF26), Ok(0x70));
+        bus.write_byte(0xFF26, 0x80).expect("power apu");
+        bus.write_byte(0xFF24, 0x77).expect("route volume");
+        bus.write_byte(0xFF25, 0x11).expect("route pulse 1");
+        bus.write_byte(0xFF11, 0x80).expect("duty");
+        bus.write_byte(0xFF12, 0xF0).expect("envelope");
+        bus.write_byte(0xFF13, 0x00).expect("frequency low");
+        bus.write_byte(0xFF14, 0x87).expect("trigger");
+
+        assert_eq!(bus.read_byte(0xFF26).unwrap() & 0x81, 0x81);
+
+        bus.advance_cycles(4_194_304 / 120);
+        assert!(!bus.take_audio_samples().is_empty());
+    }
+
+    #[test]
+    fn wave_ram_is_mapped_through_apu() {
+        let mut bus = Bus::default();
+
+        bus.write_byte(0xFF30, 0xAB).expect("write wave ram");
+
+        assert_eq!(bus.read_byte(0xFF30), Ok(0xAB));
     }
 
     #[test]

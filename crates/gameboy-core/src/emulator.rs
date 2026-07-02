@@ -1,4 +1,5 @@
 use crate::{
+    apu::AudioSample,
     bus::Bus,
     cartridge::Cartridge,
     cpu::{Cpu, Registers},
@@ -124,6 +125,10 @@ impl Emulator {
 
     pub fn take_serial_output(&mut self) -> Vec<u8> {
         self.bus.take_serial_output()
+    }
+
+    pub fn take_audio_samples(&mut self) -> Vec<AudioSample> {
+        self.bus.take_audio_samples()
     }
 }
 
