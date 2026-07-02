@@ -9,7 +9,7 @@ const FLAG_SUBTRACT: u8 = 0b0100_0000;
 const FLAG_HALF_CARRY: u8 = 0b0010_0000;
 const FLAG_CARRY: u8 = 0b0001_0000;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Flag {
     Zero,
     Subtract,
@@ -17,7 +17,7 @@ pub enum Flag {
     Carry,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CpuMode {
     #[default]
     Running,
@@ -25,7 +25,7 @@ pub enum CpuMode {
     Stopped,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum Register8 {
     B,
     C,
@@ -37,7 +37,7 @@ enum Register8 {
     A,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum Register16 {
     BC,
     DE,
@@ -45,7 +45,7 @@ enum Register16 {
     SP,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum AluOperation {
     Add,
     Adc,
@@ -57,7 +57,7 @@ enum AluOperation {
     Cp,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum JumpCondition {
     NotZero,
     Zero,
@@ -65,7 +65,7 @@ enum JumpCondition {
     Carry,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum RotateOperation {
     Rlc,
     Rrc,
@@ -77,7 +77,7 @@ enum RotateOperation {
     Srl,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Registers {
     pub a: u8,
     pub f: u8,
@@ -175,7 +175,7 @@ impl Flag {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Cpu {
     registers: Registers,
     mode: CpuMode,

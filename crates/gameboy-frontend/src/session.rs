@@ -54,6 +54,31 @@ impl Session {
         })
     }
 
+    pub fn snapshot(&self) -> Result<Vec<u8>, String> {
+        bincode::serialize(&self.emulator)
+            .map_err(|err| format!("failed to serialize save state: {err}"))
+    }
+
+    pub fn restore(rom_path: &Path, state: &[u8]) -> Result<Self, String> {
+        let emulator: Emulator = bincode::deserialize(state)
+            .map_err(|err| format!("failed to load save state: {err}"))?;
+
+        let save_path = rom_path.with_extension("sav");
+        let rtc_path = rom_path.with_extension("rtc");
+
+        let audio = AudioOutput::new();
+        if audio.is_none() {
+            eprintln!("no audio output available; running without sound");
+        }
+
+        Ok(Self {
+            emulator,
+            save_path,
+            rtc_path,
+            audio,
+        })
+    }
+
     pub fn has_audio(&self) -> bool {
         self.audio.is_some()
     }

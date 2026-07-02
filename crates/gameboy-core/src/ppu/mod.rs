@@ -19,7 +19,7 @@ const TILE_MAP_SIZE: usize = 32;
 const CGB_PALETTE_RAM_SIZE: usize = 64;
 const DMG_COLORS: [u32; 4] = [0xFFFF_FFFF, 0xFFAA_AAAA, 0xFF55_5555, 0xFF00_0000];
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PpuMode {
     #[default]
     HBlank = 0,
@@ -28,7 +28,7 @@ pub enum PpuMode {
     Drawing = 3,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Ppu {
     lcdc: u8,
     stat: u8,
@@ -49,7 +49,9 @@ pub struct Ppu {
     vbk: u8,
     bcps: u8,
     ocps: u8,
+    #[serde(with = "crate::memory::byte_array")]
     bg_palette_ram: [u8; CGB_PALETTE_RAM_SIZE],
+    #[serde(with = "crate::memory::byte_array")]
     obj_palette_ram: [u8; CGB_PALETTE_RAM_SIZE],
     vram: [MemoryRegion<VRAM_SIZE>; 2],
     oam: MemoryRegion<OAM_SIZE>,
@@ -58,13 +60,13 @@ pub struct Ppu {
     bg_attr_priority: Vec<bool>,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PpuInterrupts {
     pub vblank: bool,
     pub stat: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct Sprite {
     oam_index: usize,
     x: i16,

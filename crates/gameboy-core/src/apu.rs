@@ -9,13 +9,13 @@ const DUTY_PATTERNS: [[u8; 8]; 4] = [
     [0, 1, 1, 1, 1, 1, 1, 0],
 ];
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AudioSample {
     pub left: i16,
     pub right: i16,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Apu {
     powered: bool,
     frame_cycles: u32,
@@ -30,7 +30,7 @@ pub struct Apu {
     noise: NoiseChannel,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct PulseChannel {
     has_sweep: bool,
     enabled: bool,
@@ -60,7 +60,7 @@ struct PulseChannel {
     nr14: u8,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct WaveChannel {
     enabled: bool,
     dac_enabled: bool,
@@ -78,7 +78,7 @@ struct WaveChannel {
     nr34: u8,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct NoiseChannel {
     enabled: bool,
     dac_enabled: bool,
@@ -529,27 +529,6 @@ impl PulseChannel {
 
     fn period(&self) -> u16 {
         (2048 - self.frequency).max(1) * 4
-    }
-}
-
-impl Default for WaveChannel {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            dac_enabled: false,
-            length_timer: 0,
-            length_enabled: false,
-            volume_code: 0,
-            frequency: 0,
-            period_timer: 0,
-            sample_index: 0,
-            wave_ram: [0; 16],
-            nr30: 0,
-            nr31: 0,
-            nr32: 0,
-            nr33: 0,
-            nr34: 0,
-        }
     }
 }
 

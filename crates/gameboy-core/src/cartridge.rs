@@ -12,7 +12,7 @@ const ROM_BANK_SIZE: usize = 16 * 1024;
 const RAM_BANK_SIZE: usize = 8 * 1024;
 const MIN_ROM_SIZE: usize = 2 * ROM_BANK_SIZE;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Cartridge {
     rom: Vec<u8>,
     ram: Vec<u8>,
@@ -20,7 +20,7 @@ pub struct Cartridge {
     mapper: Mapper,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CartridgeHeader {
     title: String,
     cartridge_type: u8,
@@ -32,7 +32,7 @@ pub struct CartridgeHeader {
     ram_size: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MapperKind {
     NoMbc,
     Mbc1,
@@ -40,7 +40,7 @@ pub enum MapperKind {
     Mbc5,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum Mapper {
     NoMbc,
     Mbc1(Mbc1),
@@ -48,7 +48,7 @@ enum Mapper {
     Mbc5(Mbc5),
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct Mbc1 {
     ram_enabled: bool,
     rom_bank_low5: u8,
@@ -56,7 +56,7 @@ struct Mbc1 {
     banking_mode: u8,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct Mbc3 {
     ram_rtc_enabled: bool,
     has_rtc: bool,
@@ -66,14 +66,14 @@ struct Mbc3 {
     rtc: Rtc,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct Mbc5 {
     ram_enabled: bool,
     rom_bank: u16,
     ram_bank: u8,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct Rtc {
     cycles: u32,
     seconds: u8,
@@ -85,7 +85,7 @@ struct Rtc {
     latched: RtcRegisters,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct RtcRegisters {
     seconds: u8,
     minutes: u8,

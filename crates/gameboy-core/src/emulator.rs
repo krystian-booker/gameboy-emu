@@ -11,7 +11,7 @@ use crate::{
 pub type CycleCount = u32;
 pub const DOTS_PER_FRAME: CycleCount = 456 * 154;
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Emulator {
     cpu: Cpu,
     bus: Bus,
@@ -277,6 +277,30 @@ mod tests {
         assert_eq!(emulator.run_frame(), Ok(456 * 144));
         assert_eq!(emulator.bus().read_byte(0xFF44), Ok(144));
         assert!(!emulator.take_frame_ready());
+    }
+
+    #[test]
+    fn snapshot_round_trip_preserves_full_state() {
+        let mut emulator = Emulator::new();
+        emulator
+            .load_rom(synthetic_rom("TEST", &[(0x0100, &[0x00, 0xC3, 0x00, 0x01])]))
+            .expect("load ROM");
+
+        for _ in 0..3 {
+            emulator.run_frame().expect("run frame");
+        }
+
+        let bytes = bincode::serialize(&emulator).expect("serialize");
+        let mut restored: Emulator = bincode::deserialize(&bytes).expect("deserialize");
+
+        assert_eq!(emulator, restored, "restored state must equal original");
+
+        for _ in 0..2 {
+            emulator.run_frame().expect("run frame");
+            restored.run_frame().expect("run frame");
+        }
+        assert_eq!(emulator, restored);
+        assert_eq!(emulator.framebuffer(), restored.framebuffer());
     }
 
     #[test]

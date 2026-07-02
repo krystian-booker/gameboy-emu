@@ -52,7 +52,7 @@ pub const INTERRUPT_TIMER: u8 = 2;
 pub const INTERRUPT_SERIAL: u8 = 3;
 pub const INTERRUPT_JOYPAD: u8 = 4;
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct Timer {
     div: u8,
     div_cycles: u32,
@@ -62,13 +62,13 @@ struct Timer {
     tima_cycles: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct Joypad {
     select: u8,
     state: JoypadState,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct CgbState {
     enabled: bool,
     double_speed: bool,
@@ -77,7 +77,7 @@ struct CgbState {
     div_remainder: u32,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct HdmaState {
     source: u16,
     dest: u16,
@@ -86,7 +86,7 @@ struct HdmaState {
     active: bool,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct DmaState {
     source_high: u8,
     active: bool,
@@ -95,7 +95,7 @@ struct DmaState {
     offset: u16,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Bus {
     cartridge: Option<Cartridge>,
     eram: MemoryRegion<0x2000>,
@@ -259,6 +259,7 @@ impl Bus {
         }
     }
 
+    #[allow(clippy::match_overlapping_arm)]
     pub fn read_byte(&self, address: u16) -> Result<u8> {
         if self.dma_blocks_cpu_access(address) {
             return Ok(0xFF);
@@ -333,6 +334,7 @@ impl Bus {
         }
     }
 
+    #[allow(clippy::match_overlapping_arm)]
     pub fn write_byte(&mut self, address: u16, value: u8) -> Result<()> {
         if self.dma_blocks_cpu_access(address) {
             return Ok(());
@@ -565,6 +567,7 @@ impl Bus {
         self.dma.active && self.dma.startup_cycles == 0 && !matches!(address, HRAM_START..=HRAM_END)
     }
 
+    #[allow(clippy::match_overlapping_arm)]
     fn dma_read_byte(&self, address: u16) -> u8 {
         match address {
             0x0000..=0x7FFF => self

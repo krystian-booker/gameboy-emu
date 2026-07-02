@@ -8,6 +8,7 @@ mod input;
 mod library;
 mod renderer;
 mod session;
+mod states;
 mod theme;
 
 use app::App;

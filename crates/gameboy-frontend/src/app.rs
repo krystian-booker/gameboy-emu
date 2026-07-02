@@ -1,4 +1,5 @@
 use std::{
+    collections::{HashMap, HashSet},
     path::PathBuf,
     sync::{mpsc, Arc, Mutex},
     time::{Duration, Instant},
@@ -20,6 +21,7 @@ use crate::{
     library::{spawn_scan, RomEntry, ScanResult},
     renderer::{Pipeline, ShaderParams},
     session::Session,
+    states::{StateMeta, StateStore},
     theme::{self, Palette, PaletteKind},
 };
 
@@ -167,6 +169,19 @@ impl ScanState {
     }
 }
 
+#[derive(Clone, Copy)]
+enum LibRow {
+    Rom(usize),
+    Orphan(usize),
+}
+
+enum LibAction {
+    Select(usize),
+    Activate(LibRow),
+    Discard(String),
+    OpenBrowser,
+}
+
 pub struct App {
     screen: Screen,
     config: Config,
@@ -174,9 +189,10 @@ pub struct App {
     scan: ScanState,
     session: Option<Session>,
     current: Option<RomEntry>,
+    states: StateStore,
+    state_textures: HashMap<String, egui::TextureHandle>,
     controls: Vec<ControlBinding>,
     gilrs: Option<Gilrs>,
-    texture: Option<egui::TextureHandle>,
     rgba: Vec<u8>,
     error: Option<String>,
     boot_started: Option<Instant>,
@@ -205,9 +221,10 @@ impl App {
             scan: ScanState::Idle,
             session: None,
             current: None,
+            states: StateStore::load(),
+            state_textures: HashMap::new(),
             controls: default_controls(),
             gilrs: Gilrs::new().ok(),
-            texture: None,
             rgba: vec![0; SCREEN_WIDTH * SCREEN_HEIGHT * 4],
             error: None,
             boot_started: Some(Instant::now()),
@@ -280,29 +297,92 @@ impl App {
     fn pause(&mut self) {
         self.bank_playtime();
         self.flush_saves();
-        self.screen = Screen::Library;
-    }
-
-    fn resume(&mut self) {
-        if self.session.is_some() {
-            self.play_since = Some(Instant::now());
-            self.screen = Screen::Playing;
-        }
-    }
-
-    fn stop(&mut self) {
-        self.bank_playtime();
-        self.flush_saves();
+        self.suspend_current();
         self.session = None;
         self.current = None;
         self.play_accumulated = Duration::ZERO;
-        if let Some(dir) = self.config.rom_dir.clone() {
-            self.start_scan(dir);
+        self.play_since = None;
+        self.screen = Screen::Library;
+    }
+
+    fn suspend_current(&mut self) {
+        let Some(session) = self.session.as_ref() else {
+            return;
+        };
+        let Some(entry) = self.current.clone() else {
+            return;
+        };
+        let state = match session.snapshot() {
+            Ok(state) => state,
+            Err(err) => {
+                self.error = Some(err);
+                return;
+            }
+        };
+        let meta = StateMeta::new(
+            entry.path.clone(),
+            entry.display_title().to_string(),
+            entry.mapper.clone(),
+            entry.color,
+            self.total_playtime().as_secs(),
+            self.rgba.clone(),
+        );
+        self.state_textures.remove(meta.slug());
+        if let Err(err) = self.states.save(meta, &state) {
+            self.error = Some(format!("failed to write save state: {err}"));
         }
+    }
+
+    fn resume_state(&mut self, meta: StateMeta) {
+        self.bank_playtime();
+        self.flush_saves();
+
+        let state = match self.states.read_state(&meta) {
+            Ok(state) => state,
+            Err(err) => {
+                self.error = Some(format!("failed to read save state: {err}"));
+                return;
+            }
+        };
+
+        match Session::restore(&meta.rom_path, &state) {
+            Ok(session) => {
+                self.session = Some(session);
+                self.current = Some(entry_from_meta(&meta));
+                self.error = None;
+                self.play_accumulated = Duration::from_secs(meta.playtime_secs);
+                self.play_since = Some(Instant::now());
+                self.screen = Screen::Playing;
+            }
+            Err(err) => {
+                self.error = Some(err);
+                self.screen = Screen::Library;
+            }
+        }
+    }
+
+    fn stop_state(&mut self, slug: &str) {
+        if let Err(err) = self.states.remove(slug) {
+            self.error = Some(format!("failed to remove save state: {err}"));
+        }
+        self.state_textures.remove(slug);
+    }
+
+    fn discard_session(&mut self) {
+        self.bank_playtime();
+        self.session = None;
+        self.current = None;
+        self.play_accumulated = Duration::ZERO;
+        self.play_since = None;
         self.screen = Screen::Library;
     }
 
     fn launch(&mut self, entry: RomEntry) {
+        if let Some(meta) = self.states.find(&entry.path).cloned() {
+            self.resume_state(meta);
+            return;
+        }
+
         self.bank_playtime();
         self.flush_saves();
         self.session = None;
@@ -413,16 +493,29 @@ impl App {
                     self.screen = Screen::Settings;
                     return;
                 }
-                let count = self.scan.entries().len();
+                let rows = self.library_rows();
+                let count = rows.len();
                 if count > 0 {
+                    if self.sel >= count {
+                        self.sel = count - 1;
+                    }
                     if down {
                         self.sel = (self.sel + 1) % count;
                     } else if up {
                         self.sel = (self.sel + count - 1) % count;
                     }
                     if select {
-                        if let Some(entry) = self.scan.entries().get(self.sel).cloned() {
-                            self.launch(entry);
+                        match rows[self.sel] {
+                            LibRow::Rom(ri) => {
+                                if let Some(entry) = self.scan.entries().get(ri).cloned() {
+                                    self.launch(entry);
+                                }
+                            }
+                            LibRow::Orphan(si) => {
+                                if let Some(meta) = self.states.entries().get(si).cloned() {
+                                    self.resume_state(meta);
+                                }
+                            }
                         }
                     }
                 }
@@ -642,9 +735,37 @@ impl App {
     }
 
 
+    fn library_rows(&self) -> Vec<LibRow> {
+        let roms = self.scan.entries();
+        let mut matched: HashSet<&str> = HashSet::new();
+        let mut rows: Vec<LibRow> = Vec::with_capacity(roms.len() + self.states.entries().len());
+        for (i, entry) in roms.iter().enumerate() {
+            if let Some(meta) = self.states.find(&entry.path) {
+                matched.insert(meta.slug());
+            }
+            rows.push(LibRow::Rom(i));
+        }
+        for (i, meta) in self.states.entries().iter().enumerate() {
+            if !matched.contains(meta.slug()) {
+                rows.push(LibRow::Orphan(i));
+            }
+        }
+        rows
+    }
+
     fn ui_library(&mut self, ui: &mut egui::Ui, pal: Palette) {
         self.poll_scan(&ui.ctx().clone());
         paint_dot_grid(ui, pal);
+
+        let rows = self.library_rows();
+        let total = rows.len();
+        if total > 0 && self.sel >= total {
+            self.sel = total - 1;
+        }
+
+        let ctx = ui.ctx().clone();
+        let sel = self.sel;
+        let mut action: Option<LibAction> = None;
 
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
@@ -665,17 +786,44 @@ impl App {
                 });
                 ui.add_space(18.0);
 
-                let mut launch = None;
-                let mut resume = false;
-                let mut stop = false;
+                {
+                    let App {
+                        scan,
+                        states,
+                        state_textures,
+                        ..
+                    } = &mut *self;
+                    let roms = scan.entries();
 
-                if self.session.is_some() {
-                    self.continue_card(ui, pal, &mut resume, &mut stop);
-                    ui.add_space(18.0);
+                    for (i, row) in rows.iter().enumerate() {
+                        let selected = i == sel;
+                        let owned;
+                        let (entry, meta): (&RomEntry, Option<&StateMeta>) = match *row {
+                            LibRow::Rom(ri) => (&roms[ri], states.find(&roms[ri].path)),
+                            LibRow::Orphan(si) => {
+                                let meta = &states.entries()[si];
+                                owned = entry_from_meta(meta);
+                                (&owned, Some(meta))
+                            }
+                        };
+                        let thumb = meta.and_then(|m| thumb_texture(state_textures, &ctx, m));
+                        let a = game_row(ui, pal, entry, meta.map(|m| (m, thumb)), selected);
+
+                        if a.discard {
+                            if let Some(m) = meta {
+                                action = Some(LibAction::Discard(m.slug().to_string()));
+                            }
+                        } else if a.activate {
+                            action = Some(LibAction::Activate(*row));
+                        } else if a.select {
+                            action = Some(LibAction::Select(i));
+                        }
+                    }
                 }
 
                 match &self.scan {
                     ScanState::Scanning(_) | ScanState::Idle => {
+                        ui.add_space(4.0);
                         ui.horizontal(|ui| {
                             ui.spinner();
                             ui.label(RichText::new("SCANNING\u{2026}").color(pal.scr2));
@@ -685,109 +833,41 @@ impl App {
                         ui.colored_label(ERROR_COLOR, err.clone());
                     }
                     ScanState::Ready(entries) if entries.is_empty() => {
+                        ui.add_space(4.0);
                         ui.label(RichText::new("NO ROMS FOUND").color(pal.scr2));
                         ui.add_space(8.0);
                         if text_button(ui, "CHANGE FOLDER", theme::silk(9.0), pal.scr, pal.bg)
                             .clicked()
+                            && action.is_none()
                         {
-                            self.open_browser(Screen::Library);
+                            action = Some(LibAction::OpenBrowser);
                         }
                     }
-                    ScanState::Ready(entries) => {
-                        for (i, entry) in entries.iter().enumerate() {
-                            let resp = menu_row(ui, pal, entry, i == self.sel);
-                            if resp.clicked() {
-                                self.sel = i;
-                            }
-                            if resp.double_clicked() {
-                                launch = Some(entry.clone());
-                            }
-                        }
-                    }
+                    ScanState::Ready(_) => {}
                 }
 
                 if let Some(err) = &self.error {
                     ui.add_space(8.0);
                     ui.colored_label(ERROR_COLOR, err);
                 }
+            });
 
-                if let Some(entry) = launch {
+        match action {
+            Some(LibAction::Select(i)) => self.sel = i,
+            Some(LibAction::Activate(LibRow::Rom(ri))) => {
+                if let Some(entry) = self.scan.entries().get(ri).cloned() {
                     self.launch(entry);
-                } else if resume {
-                    self.resume();
-                } else if stop {
-                    self.stop();
                 }
-            });
-    }
-
-    fn continue_card(
-        &self,
-        ui: &mut egui::Ui,
-        pal: Palette,
-        resume: &mut bool,
-        stop: &mut bool,
-    ) {
-        egui::Frame::default()
-            .fill(pal.tint(10))
-            .stroke(Stroke::new(2.0, pal.scr))
-            .corner_radius(CornerRadius::same(5))
-            .inner_margin(Margin::symmetric(18, 15))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    let thumb = vec2(56.0, 52.0);
-                    let (trect, _) = ui.allocate_exact_size(thumb, Sense::hover());
-                    if let Some(texture) = &self.texture {
-                        egui::Image::new(SizedTexture::new(texture.id(), thumb)).paint_at(ui, trect);
-                    } else {
-                        ui.painter()
-                            .rect_filled(trect, CornerRadius::same(2), pal.scr);
-                    }
-
-                    ui.add_space(6.0);
-                    ui.vertical(|ui| {
-                        ui.label(
-                            RichText::new("\u{25B6} CONTINUE")
-                                .font(theme::pixel(9.0))
-                                .color(pal.acc),
-                        );
-                        ui.add_space(6.0);
-                        let title = self
-                            .current
-                            .as_ref()
-                            .map(|e| e.display_title().to_uppercase())
-                            .unwrap_or_default();
-                        ui.label(RichText::new(title).font(theme::mono(17.0)).color(pal.scr));
-                        ui.add_space(2.0);
-                        let mapper = self
-                            .current
-                            .as_ref()
-                            .map(|e| e.mapper.as_str())
-                            .unwrap_or("");
-                        ui.label(
-                            RichText::new(format!(
-                                "PAUSED \u{2014} {} \u{00B7} {}",
-                                format_duration(self.total_playtime()),
-                                mapper
-                            ))
-                            .font(theme::mono(12.5))
-                            .color(pal.scr2),
-                        );
-                    });
-
-                    ui.with_layout(Layout::top_down(Align::Max), |ui| {
-                        if text_button(ui, "\u{25B6} RESUME", theme::pixel(9.0), pal.scr, pal.bg)
-                            .clicked()
-                        {
-                            *resume = true;
-                        }
-                        ui.add_space(2.0);
-                        if ghost_button(ui, "STOP", theme::pixel(9.0), pal).clicked() {
-                            *stop = true;
-                        }
-                    });
-                });
-            });
+            }
+            Some(LibAction::Activate(LibRow::Orphan(si))) => {
+                if let Some(meta) = self.states.entries().get(si).cloned() {
+                    self.resume_state(meta);
+                }
+            }
+            Some(LibAction::Discard(slug)) => self.stop_state(&slug),
+            Some(LibAction::OpenBrowser) => self.open_browser(Screen::Library),
+            None => {}
+        }
     }
 
 
@@ -1092,7 +1172,7 @@ impl App {
             while ran < MAX_FRAMES_PER_TICK && session.ready_for_more() {
                 if let Err(err) = session.run_frame() {
                     self.error = Some(err);
-                    self.stop();
+                    self.discard_session();
                     return;
                 }
                 ran += 1;
@@ -1102,7 +1182,7 @@ impl App {
             }
         }
 
-        self.upload_frame(&ctx, pal);
+        self.upload_frame(pal);
         self.draw_screen(ui, pal);
 
         if has_audio {
@@ -1112,7 +1192,7 @@ impl App {
         }
     }
 
-    fn upload_frame(&mut self, ctx: &egui::Context, pal: Palette) {
+    fn upload_frame(&mut self, pal: Palette) {
         let Some(session) = self.session.as_ref() else {
             return;
         };
@@ -1135,14 +1215,6 @@ impl App {
                 out[2] = *pixel as u8;
             }
             out[3] = 0xFF;
-        }
-
-        let image =
-            egui::ColorImage::from_rgba_unmultiplied([SCREEN_WIDTH, SCREEN_HEIGHT], &self.rgba);
-        let options = egui::TextureOptions::NEAREST;
-        match &mut self.texture {
-            Some(texture) => texture.set(image, options),
-            None => self.texture = Some(ctx.load_texture("gb_screen", image, options)),
         }
     }
 
@@ -1253,8 +1325,10 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        if let Some(session) = &self.session {
-            let _ = session.persist_saves();
+        if self.session.is_some() {
+            self.bank_playtime();
+            self.flush_saves();
+            self.suspend_current();
         }
     }
 }
@@ -1277,24 +1351,59 @@ fn text_button(
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
-fn ghost_button(ui: &mut egui::Ui, label: &str, font: FontId, pal: Palette) -> egui::Response {
-    let galley = ui.painter().layout_no_wrap(label.to_string(), font, pal.scr);
-    let pad = vec2(13.0, 8.0);
-    let (rect, resp) = ui.allocate_at_least(galley.size() + pad * 2.0, Sense::click());
-    let stroke = if resp.hovered() { pal.scr } else { pal.line };
-    ui.painter()
-        .rect_stroke(rect, CornerRadius::same(3), Stroke::new(2.0, stroke), StrokeKind::Inside);
-    ui.painter()
-        .galley(rect.center() - galley.size() / 2.0, galley, pal.scr);
-    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+fn entry_from_meta(meta: &StateMeta) -> RomEntry {
+    let file_name = meta
+        .rom_path
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    RomEntry {
+        path: meta.rom_path.clone(),
+        file_name,
+        title: meta.title.clone(),
+        color: meta.color,
+        mapper: meta.mapper.clone(),
+    }
 }
 
-fn menu_row(ui: &mut egui::Ui, pal: Palette, entry: &RomEntry, selected: bool) -> egui::Response {
-    let height = 46.0;
+struct RowAction {
+    select: bool,
+    activate: bool,
+    discard: bool,
+}
+
+fn thumb_texture<'a>(
+    cache: &'a mut HashMap<String, egui::TextureHandle>,
+    ctx: &egui::Context,
+    meta: &StateMeta,
+) -> Option<&'a egui::TextureHandle> {
+    if meta.thumbnail.len() != SCREEN_WIDTH * SCREEN_HEIGHT * 4 {
+        return None;
+    }
+    Some(cache.entry(meta.slug().to_string()).or_insert_with(|| {
+        let image =
+            egui::ColorImage::from_rgba_unmultiplied([SCREEN_WIDTH, SCREEN_HEIGHT], &meta.thumbnail);
+        ctx.load_texture(
+            format!("thumb_{}", meta.slug()),
+            image,
+            egui::TextureOptions::NEAREST,
+        )
+    }))
+}
+
+fn game_row(
+    ui: &mut egui::Ui,
+    pal: Palette,
+    entry: &RomEntry,
+    suspend: Option<(&StateMeta, Option<&egui::TextureHandle>)>,
+    selected: bool,
+) -> RowAction {
+    let pad = 16.0;
+    let height = if suspend.is_some() { 58.0 } else { 46.0 };
     let (rect, resp) = ui.allocate_at_least(vec2(ui.available_width(), height), Sense::click());
     let hovered = resp.hovered();
 
-    let (bg, fg, badge_col) = if selected {
+    let (bg, fg, sub) = if selected {
         (pal.scr, pal.bg, pal.bg)
     } else if hovered {
         (pal.tint(22), pal.scr, pal.scr2)
@@ -1302,34 +1411,100 @@ fn menu_row(ui: &mut egui::Ui, pal: Palette, entry: &RomEntry, selected: bool) -
         (Color32::TRANSPARENT, pal.scr, pal.scr2)
     };
 
-    let painter = ui.painter();
-    painter.rect_filled(rect, CornerRadius::same(3), bg);
+    let x_center = pos2(rect.right() - pad - 46.0, rect.center().y);
+    let mut discard = false;
+    let mut x_hovered = false;
+    if suspend.is_some() {
+        let x_resp = ui
+            .interact(
+                Rect::from_center_size(x_center, vec2(26.0, 26.0)),
+                resp.id.with("discard"),
+                Sense::click(),
+            )
+            .on_hover_text("Discard save state");
+        discard = x_resp.clicked();
+        x_hovered = x_resp.hovered();
+    }
 
-    let pad = 16.0;
-    painter.text(
-        pos2(rect.left() + pad, rect.center().y),
-        Align2::LEFT_CENTER,
-        if selected { "\u{25BA}" } else { " " },
-        theme::mono(14.0),
-        fg,
-    );
-    painter.text(
-        pos2(rect.left() + pad + 26.0, rect.center().y),
-        Align2::LEFT_CENTER,
-        entry.display_title().to_uppercase(),
-        theme::mono(16.0),
-        fg,
-    );
+    ui.painter().rect_filled(rect, CornerRadius::same(3), bg);
+
+    let title_x = if let Some((_, thumb)) = suspend {
+        let (tw, th) = (52.0, height - 14.0);
+        let trect =
+            Rect::from_min_size(pos2(rect.left() + pad, rect.center().y - th / 2.0), vec2(tw, th));
+        if let Some(tex) = thumb {
+            egui::Image::new(SizedTexture::new(tex.id(), vec2(tw, th))).paint_at(ui, trect);
+        } else {
+            ui.painter().rect_filled(trect, CornerRadius::same(2), pal.scr);
+        }
+        trect.right() + 12.0
+    } else {
+        ui.painter().text(
+            pos2(rect.left() + pad, rect.center().y),
+            Align2::LEFT_CENTER,
+            if selected { "\u{25BA}" } else { " " },
+            theme::mono(14.0),
+            fg,
+        );
+        rect.left() + pad + 26.0
+    };
+
+    if let Some((meta, _)) = suspend {
+        ui.painter().text(
+            pos2(title_x, rect.center().y - 9.0),
+            Align2::LEFT_CENTER,
+            entry.display_title().to_uppercase(),
+            theme::mono(16.0),
+            fg,
+        );
+        let paused = format!(
+            "\u{275A}\u{275A} PAUSED {} \u{00B7} {}",
+            format_duration(Duration::from_secs(meta.playtime_secs)),
+            meta.mapper
+        );
+        ui.painter().text(
+            pos2(title_x, rect.center().y + 11.0),
+            Align2::LEFT_CENTER,
+            paused,
+            theme::mono(11.0),
+            if selected { pal.bg } else { pal.acc },
+        );
+    } else {
+        ui.painter().text(
+            pos2(title_x, rect.center().y),
+            Align2::LEFT_CENTER,
+            entry.display_title().to_uppercase(),
+            theme::mono(16.0),
+            fg,
+        );
+    }
+
     let badge = if entry.color { "GBC" } else { "GB" };
-    painter.text(
+    ui.painter().text(
         pos2(rect.right() - pad, rect.center().y),
         Align2::RIGHT_CENTER,
         badge,
-        theme::silk(9.0),
-        badge_col,
+        theme::silk(12.0),
+        sub,
     );
+    if suspend.is_some() {
+        let x_col = if selected {
+            pal.bg
+        } else if x_hovered {
+            ERROR_COLOR
+        } else {
+            sub
+        };
+        ui.painter()
+            .text(x_center, Align2::CENTER_CENTER, "\u{2715}", theme::mono(19.0), x_col);
+    }
 
-    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+    RowAction {
+        select: resp.clicked() && !discard,
+        activate: resp.double_clicked() && !discard,
+        discard,
+    }
 }
 
 fn rebind_chip(ui: &mut egui::Ui, pal: Palette, text: &str, listening: bool) -> egui::Response {

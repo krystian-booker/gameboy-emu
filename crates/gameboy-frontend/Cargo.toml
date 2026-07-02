@@ -9,5 +9,6 @@ gameboy-core = { path = "../gameboy-core" }
 eframe = { version = "0.35", default-features = false, features = ["glow", "persistence"] }
 egui = "0.35"
 serde = { version = "1", features = ["derive"] }
+bincode = "1"
 cpal = "0.15"
 gilrs = "0.11"
