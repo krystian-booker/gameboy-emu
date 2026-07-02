@@ -29,10 +29,17 @@ const TIMA: u16 = 0xFF05;
 const TMA: u16 = 0xFF06;
 const TAC: u16 = 0xFF07;
 const INTERRUPT_FLAG: u16 = 0xFF0F;
+const NR14: u16 = 0xFF14;
+const NR24: u16 = 0xFF19;
+const NR52: u16 = 0xFF26;
 const DMA: u16 = 0xFF46;
+const KEY1: u16 = 0xFF4D;
 const HRAM_START: u16 = 0xFF80;
 const HRAM_END: u16 = 0xFFFE;
 const INTERRUPT_ENABLE: u16 = 0xFFFF;
+const OAM_DMA_BYTES: u16 = 0xA0;
+const OAM_DMA_STARTUP_CYCLES: u32 = 4;
+const OAM_DMA_BYTE_CYCLES: u32 = 4;
 
 pub const INTERRUPT_VBLANK: u8 = 0;
 pub const INTERRUPT_LCD_STAT: u8 = 1;
@@ -57,6 +64,31 @@ struct Joypad {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct CgbState {
+    enabled: bool,
+    double_speed: bool,
+    prepare_speed_switch: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ApuStub {
+    powered: bool,
+    channel1_active: bool,
+    channel1_cycles: u32,
+    channel2_active: bool,
+    channel2_cycles: u32,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct DmaState {
+    source_high: u8,
+    active: bool,
+    startup_cycles: u32,
+    byte_cycles: u32,
+    offset: u16,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Bus {
     cartridge: Option<Cartridge>,
     eram: MemoryRegion<0x2000>,
@@ -67,6 +99,9 @@ pub struct Bus {
     timer: Timer,
     joypad: Joypad,
     serial: Serial,
+    cgb: CgbState,
+    apu: ApuStub,
+    dma: DmaState,
     ppu: Ppu,
 }
 
@@ -79,7 +114,18 @@ impl Bus {
         self.cartridge.as_ref()
     }
 
+    pub fn cartridge_mut(&mut self) -> Option<&mut Cartridge> {
+        self.cartridge.as_mut()
+    }
+
     pub fn advance_cycles(&mut self, cycles: u32) {
+        if let Some(cartridge) = self.cartridge.as_mut() {
+            cartridge.advance_cycles(cycles);
+        }
+
+        self.apu.advance_cycles(cycles);
+        self.advance_dma(cycles);
+
         self.timer.div_cycles += cycles;
         while self.timer.div_cycles >= 256 {
             self.timer.div_cycles -= 256;
@@ -154,7 +200,27 @@ impl Bus {
         self.serial.drain_output()
     }
 
+    pub fn set_cgb_mode(&mut self, enabled: bool) {
+        self.cgb.enabled = enabled;
+        self.cgb.double_speed = false;
+        self.cgb.prepare_speed_switch = false;
+    }
+
+    pub fn stop(&mut self) -> bool {
+        if self.cgb.enabled && self.cgb.prepare_speed_switch {
+            self.cgb.double_speed = !self.cgb.double_speed;
+            self.cgb.prepare_speed_switch = false;
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn read_byte(&self, address: u16) -> Result<u8> {
+        if self.dma_blocks_cpu_access(address) {
+            return Ok(0xFF);
+        }
+
         match address {
             0x0000..=0x7FFF => self
                 .cartridge
@@ -190,7 +256,9 @@ impl Bus {
             JOYPAD => Ok(self.joypad.read()),
             SERIAL_DATA => Ok(self.serial.read_data()),
             SERIAL_CONTROL => Ok(self.serial.read_control()),
+            NR52 => Ok(self.apu.read_nr52()),
             INTERRUPT_FLAG => Ok(self.interrupt_flag() | 0xE0),
+            KEY1 => Ok(self.cgb.read_key1()),
             0xFF40..=0xFF4B => self
                 .ppu
                 .read_register(address)
@@ -209,6 +277,10 @@ impl Bus {
     }
 
     pub fn write_byte(&mut self, address: u16, value: u8) -> Result<()> {
+        if self.dma_blocks_cpu_access(address) {
+            return Ok(());
+        }
+
         let wrote = match address {
             0x0000..=0x7FFF => {
                 if let Some(cartridge) = self.cartridge.as_mut() {
@@ -265,12 +337,24 @@ impl Bus {
                 }
                 true
             }
+            NR14 => {
+                self.apu.write_nr14(value, self.cgb.double_speed);
+                self.io.write((NR14 - IO_START) as usize, value)
+            }
+            NR24 => {
+                self.apu.write_nr24(value);
+                self.io.write((NR24 - IO_START) as usize, value)
+            }
+            NR52 => {
+                self.apu.write_nr52(value);
+                self.io.write((NR52 - IO_START) as usize, value)
+            }
             INTERRUPT_FLAG => self
                 .io
                 .write((INTERRUPT_FLAG - IO_START) as usize, value & 0x1F),
             DMA => {
                 let wrote = self.io.write((DMA - IO_START) as usize, value);
-                self.dma_transfer(value);
+                self.start_dma(value);
                 wrote
             }
             0xFF40..=0xFF4B => {
@@ -279,6 +363,10 @@ impl Bus {
                 } else {
                     self.io.write((address - IO_START) as usize, value)
                 }
+            }
+            KEY1 => {
+                self.cgb.write_key1(value);
+                true
             }
             IO_START..=IO_END => self.io.write((address - IO_START) as usize, value),
             HRAM_START..=HRAM_END => self.hram.write((address - HRAM_START) as usize, value),
@@ -308,12 +396,52 @@ impl Bus {
             .write((INTERRUPT_FLAG - IO_START) as usize, value & 0x1F);
     }
 
-    fn dma_transfer(&mut self, source_high: u8) {
-        let source = (source_high as u16) << 8;
-        for offset in 0..0xA0 {
-            let value = self.dma_read_byte(source + offset);
-            self.ppu.write_oam_raw(offset, value);
+    fn start_dma(&mut self, source_high: u8) {
+        self.dma = DmaState {
+            source_high,
+            active: true,
+            startup_cycles: OAM_DMA_STARTUP_CYCLES,
+            byte_cycles: 0,
+            offset: 0,
+        };
+    }
+
+    fn advance_dma(&mut self, cycles: u32) {
+        if !self.dma.active {
+            return;
         }
+
+        let mut remaining = cycles;
+        if self.dma.startup_cycles > 0 {
+            let elapsed = self.dma.startup_cycles.min(remaining);
+            self.dma.startup_cycles -= elapsed;
+            remaining -= elapsed;
+        }
+
+        self.dma.byte_cycles += remaining;
+        while self.dma.active
+            && self.dma.startup_cycles == 0
+            && self.dma.byte_cycles >= OAM_DMA_BYTE_CYCLES
+        {
+            self.dma.byte_cycles -= OAM_DMA_BYTE_CYCLES;
+            self.dma_copy_next_byte();
+        }
+    }
+
+    fn dma_copy_next_byte(&mut self) {
+        let source = ((self.dma.source_high as u16) << 8).wrapping_add(self.dma.offset);
+        let value = self.dma_read_byte(source);
+        self.ppu.write_oam_raw(self.dma.offset, value);
+        self.dma.offset += 1;
+
+        if self.dma.offset >= OAM_DMA_BYTES {
+            self.dma.active = false;
+            self.dma.byte_cycles = 0;
+        }
+    }
+
+    fn dma_blocks_cpu_access(&self, address: u16) -> bool {
+        self.dma.active && self.dma.startup_cycles == 0 && !matches!(address, HRAM_START..=HRAM_END)
     }
 
     fn dma_read_byte(&self, address: u16) -> u8 {
@@ -346,7 +474,9 @@ impl Bus {
             JOYPAD => self.joypad.read(),
             SERIAL_DATA => self.serial.read_data(),
             SERIAL_CONTROL => self.serial.read_control(),
+            NR52 => self.apu.read_nr52(),
             INTERRUPT_FLAG => self.interrupt_flag() | 0xE0,
+            KEY1 => self.cgb.read_key1(),
             0xFF40..=0xFF4B => self
                 .ppu
                 .read_register(address)
@@ -395,6 +525,72 @@ impl Joypad {
 
     fn state(&self) -> JoypadState {
         self.state
+    }
+}
+
+impl CgbState {
+    fn read_key1(&self) -> u8 {
+        if !self.enabled {
+            return 0xFF;
+        }
+
+        0x7E | (u8::from(self.double_speed) << 7) | u8::from(self.prepare_speed_switch)
+    }
+
+    fn write_key1(&mut self, value: u8) {
+        if self.enabled {
+            self.prepare_speed_switch = value & 0x01 != 0;
+        }
+    }
+}
+
+impl ApuStub {
+    fn advance_cycles(&mut self, cycles: u32) {
+        advance_channel(&mut self.channel1_active, &mut self.channel1_cycles, cycles);
+        advance_channel(&mut self.channel2_active, &mut self.channel2_cycles, cycles);
+    }
+
+    fn read_nr52(&self) -> u8 {
+        if !self.powered {
+            return 0;
+        }
+
+        0x80 | u8::from(self.channel1_active) | (u8::from(self.channel2_active) << 1)
+    }
+
+    fn write_nr14(&mut self, value: u8, double_speed: bool) {
+        if self.powered && value & 0x80 != 0 {
+            self.channel1_active = true;
+            self.channel1_cycles = if double_speed { 32_000 } else { 12_000 };
+        }
+    }
+
+    fn write_nr24(&mut self, value: u8) {
+        if self.powered && value & 0x80 != 0 {
+            self.channel2_active = true;
+            self.channel2_cycles = 2_048;
+        }
+    }
+
+    fn write_nr52(&mut self, value: u8) {
+        self.powered = value & 0x80 != 0;
+        if !self.powered {
+            self.channel1_active = false;
+            self.channel1_cycles = 0;
+            self.channel2_active = false;
+            self.channel2_cycles = 0;
+        }
+    }
+}
+
+fn advance_channel(active: &mut bool, cycles_left: &mut u32, cycles: u32) {
+    if !*active {
+        return;
+    }
+
+    *cycles_left = cycles_left.saturating_sub(cycles);
+    if *cycles_left == 0 {
+        *active = false;
     }
 }
 
@@ -563,15 +759,56 @@ mod tests {
     #[test]
     fn dma_copies_source_page_into_ppu_oam() {
         let mut bus = Bus::default();
+        bus.write_byte(0xFF40, 0x00).expect("disable lcd");
 
         bus.write_byte(0xC000, 0x12).expect("write source");
         bus.write_byte(0xC09F, 0x34).expect("write source");
         bus.write_byte(0xFF46, 0xC0).expect("start dma");
 
-        bus.advance_cycles(80 + 172);
+        assert_eq!(bus.read_byte(0xFE00), Ok(0x00));
+
+        bus.advance_cycles(OAM_DMA_STARTUP_CYCLES + OAM_DMA_BYTE_CYCLES);
+        assert_eq!(bus.read_byte(0xFE00), Ok(0xFF));
+        assert_eq!(bus.dma_read_byte(0xFE00), 0x12);
+        assert_eq!(bus.dma_read_byte(0xFE01), 0x00);
+
+        bus.advance_cycles((OAM_DMA_BYTES as u32 - 1) * OAM_DMA_BYTE_CYCLES);
         assert_eq!(bus.read_byte(0xFE00), Ok(0x12));
         assert_eq!(bus.read_byte(0xFE9F), Ok(0x34));
         assert_eq!(bus.read_byte(0xFF46), Ok(0xC0));
+    }
+
+    #[test]
+    fn oam_dma_blocks_cpu_access_outside_hram_after_startup() {
+        let mut bus = Bus::default();
+        bus.write_byte(0xC000, 0x12).expect("write wram");
+        bus.write_byte(0xFF80, 0x34).expect("write hram");
+
+        bus.write_byte(DMA, 0xC0).expect("start dma");
+        assert_eq!(bus.read_byte(0xC000), Ok(0x12));
+
+        bus.advance_cycles(OAM_DMA_STARTUP_CYCLES);
+        assert_eq!(bus.read_byte(0xC000), Ok(0xFF));
+        assert_eq!(bus.read_byte(INTERRUPT_ENABLE), Ok(0xFF));
+        assert_eq!(bus.read_byte(0xFF80), Ok(0x34));
+
+        bus.write_byte(0xC000, 0x56).expect("blocked write");
+        assert_eq!(bus.dma_read_byte(0xC000), 0x12);
+    }
+
+    #[test]
+    fn oam_dma_finishes_after_all_bytes_are_copied() {
+        let mut bus = Bus::default();
+        bus.write_byte(0xFF40, 0x00).expect("disable lcd");
+        bus.write_byte(0xC000, 0x12).expect("write source");
+        bus.write_byte(0xC09F, 0x34).expect("write source");
+
+        bus.write_byte(DMA, 0xC0).expect("start dma");
+        bus.advance_cycles(OAM_DMA_STARTUP_CYCLES + OAM_DMA_BYTES as u32 * OAM_DMA_BYTE_CYCLES);
+
+        assert_eq!(bus.read_byte(0xC000), Ok(0x12));
+        assert_eq!(bus.read_byte(0xFE00), Ok(0x12));
+        assert_eq!(bus.read_byte(0xFE9F), Ok(0x34));
     }
 
     #[test]

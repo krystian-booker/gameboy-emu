@@ -26,15 +26,59 @@ impl Emulator {
 
     pub fn load_rom(&mut self, bytes: Vec<u8>) -> Result<()> {
         let cartridge = Cartridge::from_bytes(bytes)?;
+        let cgb_mode = cartridge.header().supports_cgb();
         self.bus.insert_cartridge(cartridge);
-        self.cpu = Cpu::new_without_boot_rom();
+        self.bus.set_cgb_mode(cgb_mode);
+        self.cpu = if cgb_mode {
+            Cpu::new_cgb_without_boot_rom()
+        } else {
+            Cpu::new_without_boot_rom()
+        };
         Ok(())
     }
 
+    pub fn has_battery_save(&self) -> bool {
+        self.bus
+            .cartridge()
+            .is_some_and(|cartridge| cartridge.save_ram().is_some())
+    }
+
+    pub fn load_save_ram(&mut self, bytes: &[u8]) -> Result<()> {
+        if let Some(cartridge) = self.bus.cartridge_mut() {
+            cartridge.load_save_ram(bytes)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn save_ram(&self) -> Option<&[u8]> {
+        self.bus
+            .cartridge()
+            .and_then(|cartridge| cartridge.save_ram())
+    }
+
+    pub fn has_battery_rtc(&self) -> bool {
+        self.bus
+            .cartridge()
+            .is_some_and(|cartridge| cartridge.save_rtc().is_some())
+    }
+
+    pub fn load_save_rtc(&mut self, bytes: &[u8]) -> Result<()> {
+        if let Some(cartridge) = self.bus.cartridge_mut() {
+            cartridge.load_save_rtc(bytes)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn save_rtc(&self) -> Option<Vec<u8>> {
+        self.bus
+            .cartridge()
+            .and_then(|cartridge| cartridge.save_rtc())
+    }
+
     pub fn step(&mut self) -> Result<CycleCount> {
-        let cycles = self.cpu.step(&mut self.bus)?;
-        self.bus.advance_cycles(cycles);
-        Ok(cycles)
+        self.cpu.step(&mut self.bus)
     }
 
     pub fn run_frame(&mut self) -> Result<CycleCount> {

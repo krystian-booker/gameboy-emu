@@ -1,6 +1,7 @@
 use std::{
     env, fs,
     io::{self, Write},
+    path::{Path, PathBuf},
     process, thread,
     time::{Duration, Instant},
 };
@@ -44,7 +45,8 @@ fn main() {
         return;
     };
 
-    let rom = match fs::read(&path) {
+    let rom_path = PathBuf::from(&path);
+    let rom = match fs::read(&rom_path) {
         Ok(rom) => rom,
         Err(err) => {
             eprintln!("failed to read {path}: {err}");
@@ -56,6 +58,37 @@ fn main() {
     if let Err(err) = emulator.load_rom(rom) {
         eprintln!("{err}");
         process::exit(1);
+    }
+
+    let save_path = save_path_for_rom(&rom_path);
+    let rtc_path = rtc_path_for_rom(&rom_path);
+    if emulator.has_battery_save() && save_path.exists() {
+        let save = match fs::read(&save_path) {
+            Ok(save) => save,
+            Err(err) => {
+                eprintln!("failed to read save {}: {err}", save_path.display());
+                process::exit(1);
+            }
+        };
+
+        if let Err(err) = emulator.load_save_ram(&save) {
+            eprintln!("failed to load save {}: {err}", save_path.display());
+            process::exit(1);
+        }
+    }
+    if emulator.has_battery_rtc() && rtc_path.exists() {
+        let save = match fs::read(&rtc_path) {
+            Ok(save) => save,
+            Err(err) => {
+                eprintln!("failed to read RTC save {}: {err}", rtc_path.display());
+                process::exit(1);
+            }
+        };
+
+        if let Err(err) = emulator.load_save_rtc(&save) {
+            eprintln!("failed to load RTC save {}: {err}", rtc_path.display());
+            process::exit(1);
+        }
     }
 
     let mut window = match Window::new(
@@ -110,6 +143,27 @@ fn main() {
             thread::sleep(FRAME_TIME - elapsed);
         }
     }
+
+    if let Some(save_ram) = emulator.save_ram() {
+        if let Err(err) = fs::write(&save_path, save_ram) {
+            eprintln!("failed to write save {}: {err}", save_path.display());
+            process::exit(1);
+        }
+    }
+    if let Some(save_rtc) = emulator.save_rtc() {
+        if let Err(err) = fs::write(&rtc_path, save_rtc) {
+            eprintln!("failed to write RTC save {}: {err}", rtc_path.display());
+            process::exit(1);
+        }
+    }
+}
+
+fn save_path_for_rom(path: &Path) -> PathBuf {
+    path.with_extension("sav")
+}
+
+fn rtc_path_for_rom(path: &Path) -> PathBuf {
+    path.with_extension("rtc")
 }
 
 fn default_controls() -> Vec<ControlBinding> {

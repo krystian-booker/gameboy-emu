@@ -145,36 +145,6 @@ impl Registers {
         self.f &= 0xF0;
     }
 
-    fn read8(&self, register: Register8, bus: &Bus) -> Result<u8> {
-        match register {
-            Register8::B => Ok(self.b),
-            Register8::C => Ok(self.c),
-            Register8::D => Ok(self.d),
-            Register8::E => Ok(self.e),
-            Register8::H => Ok(self.h),
-            Register8::L => Ok(self.l),
-            Register8::AddressHl => bus.read_byte(self.hl()),
-            Register8::A => Ok(self.a),
-        }
-    }
-
-    fn write8(&mut self, register: Register8, bus: &mut Bus, value: u8) -> Result<()> {
-        match register {
-            Register8::B => self.b = value,
-            Register8::C => self.c = value,
-            Register8::D => self.d = value,
-            Register8::E => self.e = value,
-            Register8::H => self.h = value,
-            Register8::L => self.l = value,
-            Register8::AddressHl => {
-                bus.write_byte(self.hl(), value)?;
-            }
-            Register8::A => self.a = value,
-        }
-
-        Ok(())
-    }
-
     fn read16(&self, register: Register16) -> u16 {
         match register {
             Register16::BC => self.bc(),
@@ -211,6 +181,8 @@ pub struct Cpu {
     mode: CpuMode,
     interrupt_master_enabled: bool,
     ime_enable_delay: Option<u8>,
+    elapsed_cycles: CycleCount,
+    halt_bug: bool,
 }
 
 impl Cpu {
@@ -228,7 +200,15 @@ impl Cpu {
             mode: CpuMode::Running,
             interrupt_master_enabled: false,
             ime_enable_delay: None,
+            elapsed_cycles: 0,
+            halt_bug: false,
         }
+    }
+
+    pub fn new_cgb_without_boot_rom() -> Self {
+        let mut cpu = Self::new_without_boot_rom();
+        cpu.registers.a = 0x11;
+        cpu
     }
 
     pub fn registers(&self) -> &Registers {
@@ -256,15 +236,20 @@ impl Cpu {
     }
 
     pub fn step(&mut self, bus: &mut Bus) -> Result<CycleCount> {
+        self.elapsed_cycles = 0;
+
         if bus.pending_interrupts() != 0 {
             self.mode = CpuMode::Running;
 
             if self.interrupt_master_enabled {
-                return self.service_interrupt(bus);
+                let cycles = self.service_interrupt(bus)?;
+                self.advance_remaining_cycles(bus, cycles);
+                return Ok(cycles);
             }
         }
 
         if self.mode == CpuMode::Halted {
+            self.idle_cycle(bus);
             self.finish_instruction();
             return Ok(4);
         }
@@ -285,7 +270,7 @@ impl Cpu {
                     Ok(12)
                 }
                 0x02 => {
-                    bus.write_byte(self.registers.bc(), self.registers.a)?;
+                    self.write_byte(bus, self.registers.bc(), self.registers.a)?;
                     Ok(8)
                 }
                 0x03 => self.increment_register16(Register16::BC),
@@ -302,12 +287,12 @@ impl Cpu {
                 0x08 => {
                     let address = self.fetch_word(bus)?;
                     let [low, high] = self.registers.sp.to_le_bytes();
-                    bus.write_byte(address, low)?;
-                    bus.write_byte(address.wrapping_add(1), high)?;
+                    self.write_byte(bus, address, low)?;
+                    self.write_byte(bus, address.wrapping_add(1), high)?;
                     Ok(20)
                 }
                 0x0A => {
-                    self.registers.a = bus.read_byte(self.registers.bc())?;
+                    self.registers.a = self.read_byte(bus, self.registers.bc())?;
                     Ok(8)
                 }
                 0x0B => self.decrement_register16(Register16::BC),
@@ -323,7 +308,9 @@ impl Cpu {
                 }
                 0x10 => {
                     let _ = self.fetch_byte(bus)?;
-                    self.mode = CpuMode::Stopped;
+                    if !bus.stop() {
+                        self.mode = CpuMode::Stopped;
+                    }
                     Ok(4)
                 }
                 0x09 => self.add_hl(self.registers.bc()),
@@ -333,7 +320,7 @@ impl Cpu {
                     Ok(12)
                 }
                 0x12 => {
-                    bus.write_byte(self.registers.de(), self.registers.a)?;
+                    self.write_byte(bus, self.registers.de(), self.registers.a)?;
                     Ok(8)
                 }
                 0x13 => self.increment_register16(Register16::DE),
@@ -352,7 +339,7 @@ impl Cpu {
                     Ok(12)
                 }
                 0x1A => {
-                    self.registers.a = bus.read_byte(self.registers.de())?;
+                    self.registers.a = self.read_byte(bus, self.registers.de())?;
                     Ok(8)
                 }
                 0x1B => self.decrement_register16(Register16::DE),
@@ -375,7 +362,7 @@ impl Cpu {
                 }
                 0x22 => {
                     let address = self.registers.hl();
-                    bus.write_byte(address, self.registers.a)?;
+                    self.write_byte(bus, address, self.registers.a)?;
                     self.registers.set_hl(address.wrapping_add(1));
                     Ok(8)
                 }
@@ -393,7 +380,7 @@ impl Cpu {
                 0x28 => self.jump_relative_if(bus, JumpCondition::Zero),
                 0x2A => {
                     let address = self.registers.hl();
-                    self.registers.a = bus.read_byte(address)?;
+                    self.registers.a = self.read_byte(bus, address)?;
                     self.registers.set_hl(address.wrapping_add(1));
                     Ok(8)
                 }
@@ -418,7 +405,7 @@ impl Cpu {
                 }
                 0x32 => {
                     let address = self.registers.hl();
-                    bus.write_byte(address, self.registers.a)?;
+                    self.write_byte(bus, address, self.registers.a)?;
                     self.registers.set_hl(address.wrapping_sub(1));
                     Ok(8)
                 }
@@ -427,7 +414,7 @@ impl Cpu {
                 0x35 => self.decrement_register(bus, Register8::AddressHl),
                 0x36 => {
                     let value = self.fetch_byte(bus)?;
-                    bus.write_byte(self.registers.hl(), value)?;
+                    self.write_byte(bus, self.registers.hl(), value)?;
                     Ok(12)
                 }
                 0x37 => {
@@ -439,7 +426,7 @@ impl Cpu {
                 0x38 => self.jump_relative_if(bus, JumpCondition::Carry),
                 0x3A => {
                     let address = self.registers.hl();
-                    self.registers.a = bus.read_byte(address)?;
+                    self.registers.a = self.read_byte(bus, address)?;
                     self.registers.set_hl(address.wrapping_sub(1));
                     Ok(8)
                 }
@@ -459,11 +446,15 @@ impl Cpu {
                 }
                 0x39 => self.add_hl(self.registers.sp),
                 0x76 => {
-                    self.mode = CpuMode::Halted;
+                    if !self.interrupt_master_enabled && bus.pending_interrupts() != 0 {
+                        self.halt_bug = true;
+                    } else {
+                        self.mode = CpuMode::Halted;
+                    }
                     Ok(4)
                 }
                 0x7E => {
-                    self.registers.a = bus.read_byte(self.registers.hl())?;
+                    self.registers.a = self.read_byte(bus, self.registers.hl())?;
                     Ok(8)
                 }
                 0xAF => {
@@ -563,7 +554,7 @@ impl Cpu {
                 }
                 0xE0 => {
                     let offset = self.fetch_byte(bus)?;
-                    bus.write_byte(0xFF00 + offset as u16, self.registers.a)?;
+                    self.write_byte(bus, 0xFF00 + offset as u16, self.registers.a)?;
                     Ok(12)
                 }
                 0xE1 => {
@@ -572,7 +563,7 @@ impl Cpu {
                     Ok(12)
                 }
                 0xE2 => {
-                    bus.write_byte(0xFF00 + self.registers.c as u16, self.registers.a)?;
+                    self.write_byte(bus, 0xFF00 + self.registers.c as u16, self.registers.a)?;
                     Ok(8)
                 }
                 0xE5 => {
@@ -599,7 +590,7 @@ impl Cpu {
                 }
                 0xEA => {
                     let address = self.fetch_word(bus)?;
-                    bus.write_byte(address, self.registers.a)?;
+                    self.write_byte(bus, address, self.registers.a)?;
                     Ok(16)
                 }
                 0xEE => {
@@ -613,7 +604,7 @@ impl Cpu {
                 }
                 0xF0 => {
                     let offset = self.fetch_byte(bus)?;
-                    self.registers.a = bus.read_byte(0xFF00 + offset as u16)?;
+                    self.registers.a = self.read_byte(bus, 0xFF00 + offset as u16)?;
                     Ok(12)
                 }
                 0xF1 => {
@@ -622,7 +613,7 @@ impl Cpu {
                     Ok(12)
                 }
                 0xF2 => {
-                    self.registers.a = bus.read_byte(0xFF00 + self.registers.c as u16)?;
+                    self.registers.a = self.read_byte(bus, 0xFF00 + self.registers.c as u16)?;
                     Ok(8)
                 }
                 0xF3 => {
@@ -655,7 +646,7 @@ impl Cpu {
                 }
                 0xFA => {
                     let address = self.fetch_word(bus)?;
-                    self.registers.a = bus.read_byte(address)?;
+                    self.registers.a = self.read_byte(bus, address)?;
                     Ok(16)
                 }
                 0xFB => {
@@ -675,27 +666,85 @@ impl Cpu {
             }?
         };
 
+        self.advance_remaining_cycles(bus, cycles);
         self.finish_instruction();
         Ok(cycles)
     }
 
-    fn fetch_byte(&mut self, bus: &Bus) -> Result<u8> {
-        let byte = bus.read_byte(self.registers.pc)?;
-        self.registers.pc = self.registers.pc.wrapping_add(1);
+    fn fetch_byte(&mut self, bus: &mut Bus) -> Result<u8> {
+        let byte = self.read_byte(bus, self.registers.pc)?;
+        if self.halt_bug {
+            self.halt_bug = false;
+        } else {
+            self.registers.pc = self.registers.pc.wrapping_add(1);
+        }
         Ok(byte)
     }
 
-    fn fetch_word(&mut self, bus: &Bus) -> Result<u16> {
+    fn fetch_word(&mut self, bus: &mut Bus) -> Result<u16> {
         let low = self.fetch_byte(bus)?;
         let high = self.fetch_byte(bus)?;
         Ok(u16::from_le_bytes([low, high]))
     }
 
+    fn read_byte(&mut self, bus: &mut Bus, address: u16) -> Result<u8> {
+        let value = bus.read_byte(address)?;
+        self.idle_cycle(bus);
+        Ok(value)
+    }
+
+    fn write_byte(&mut self, bus: &mut Bus, address: u16, value: u8) -> Result<()> {
+        bus.write_byte(address, value)?;
+        self.idle_cycle(bus);
+        Ok(())
+    }
+
+    fn read8(&mut self, bus: &mut Bus, register: Register8) -> Result<u8> {
+        match register {
+            Register8::B => Ok(self.registers.b),
+            Register8::C => Ok(self.registers.c),
+            Register8::D => Ok(self.registers.d),
+            Register8::E => Ok(self.registers.e),
+            Register8::H => Ok(self.registers.h),
+            Register8::L => Ok(self.registers.l),
+            Register8::AddressHl => self.read_byte(bus, self.registers.hl()),
+            Register8::A => Ok(self.registers.a),
+        }
+    }
+
+    fn write8(&mut self, bus: &mut Bus, register: Register8, value: u8) -> Result<()> {
+        match register {
+            Register8::B => self.registers.b = value,
+            Register8::C => self.registers.c = value,
+            Register8::D => self.registers.d = value,
+            Register8::E => self.registers.e = value,
+            Register8::H => self.registers.h = value,
+            Register8::L => self.registers.l = value,
+            Register8::AddressHl => {
+                self.write_byte(bus, self.registers.hl(), value)?;
+            }
+            Register8::A => self.registers.a = value,
+        }
+
+        Ok(())
+    }
+
+    fn idle_cycle(&mut self, bus: &mut Bus) {
+        bus.advance_cycles(4);
+        self.elapsed_cycles += 4;
+    }
+
+    fn advance_remaining_cycles(&mut self, bus: &mut Bus, cycles: CycleCount) {
+        while self.elapsed_cycles < cycles {
+            self.idle_cycle(bus);
+        }
+    }
+
     fn load_register_from_register(&mut self, bus: &mut Bus, opcode: u8) -> Result<CycleCount> {
         let destination = decode_register8((opcode >> 3) & 0b111);
         let source = decode_register8(opcode & 0b111);
-        let value = self.registers.read8(source, bus)?;
-        self.registers.write8(destination, bus, value)?;
+        let value = self.read8(bus, source)?;
+        self.write8(bus, destination, value)?;
 
         if destination == Register8::AddressHl || source == Register8::AddressHl {
             Ok(8)
@@ -704,7 +753,7 @@ impl Cpu {
         }
     }
 
-    fn execute_register_alu(&mut self, bus: &Bus, opcode: u8) -> Result<CycleCount> {
+    fn execute_register_alu(&mut self, bus: &mut Bus, opcode: u8) -> Result<CycleCount> {
         let operation = match opcode >> 3 {
             0x10 => AluOperation::Add,
             0x11 => AluOperation::Adc,
@@ -717,7 +766,7 @@ impl Cpu {
             _ => unreachable!("ALU opcode range must decode to an ALU operation"),
         };
         let source = decode_register8(opcode & 0b111);
-        let value = self.registers.read8(source, bus)?;
+        let value = self.read8(bus, source)?;
         self.execute_alu(operation, value);
 
         if source == Register8::AddressHl {
@@ -775,26 +824,26 @@ impl Cpu {
                     7 => RotateOperation::Srl,
                     _ => unreachable!("CB rotate/shift group is 3 bits"),
                 };
-                let value = self.registers.read8(register, bus)?;
+                let value = self.read8(bus, register)?;
                 let result = self.rotate_shift_value(operation, value, true);
-                self.registers.write8(register, bus, result)?;
+                self.write8(bus, register, result)?;
             }
             0x40..=0x7F => {
                 let bit = (opcode >> 3) & 0b111;
-                let value = self.registers.read8(register, bus)?;
+                let value = self.read8(bus, register)?;
                 self.registers.set_flag(Flag::Zero, value & (1 << bit) == 0);
                 self.registers.set_flag(Flag::Subtract, false);
                 self.registers.set_flag(Flag::HalfCarry, true);
             }
             0x80..=0xBF => {
                 let bit = (opcode >> 3) & 0b111;
-                let value = self.registers.read8(register, bus)? & !(1 << bit);
-                self.registers.write8(register, bus, value)?;
+                let value = self.read8(bus, register)? & !(1 << bit);
+                self.write8(bus, register, value)?;
             }
             0xC0..=0xFF => {
                 let bit = (opcode >> 3) & 0b111;
-                let value = self.registers.read8(register, bus)? | (1 << bit);
-                self.registers.write8(register, bus, value)?;
+                let value = self.read8(bus, register)? | (1 << bit);
+                self.write8(bus, register, value)?;
             }
         }
 
@@ -899,9 +948,9 @@ impl Cpu {
     }
 
     fn increment_register(&mut self, bus: &mut Bus, register: Register8) -> Result<CycleCount> {
-        let value = self.registers.read8(register, bus)?;
+        let value = self.read8(bus, register)?;
         let result = value.wrapping_add(1);
-        self.registers.write8(register, bus, result)?;
+        self.write8(bus, register, result)?;
 
         self.registers.set_flag(Flag::Zero, result == 0);
         self.registers.set_flag(Flag::Subtract, false);
@@ -916,9 +965,9 @@ impl Cpu {
     }
 
     fn decrement_register(&mut self, bus: &mut Bus, register: Register8) -> Result<CycleCount> {
-        let value = self.registers.read8(register, bus)?;
+        let value = self.read8(bus, register)?;
         let result = value.wrapping_sub(1);
-        self.registers.write8(register, bus, result)?;
+        self.write8(bus, register, result)?;
 
         self.registers.set_flag(Flag::Zero, result == 0);
         self.registers.set_flag(Flag::Subtract, true);
@@ -960,15 +1009,15 @@ impl Cpu {
     fn push_stack(&mut self, bus: &mut Bus, value: u16) -> Result<()> {
         let [high, low] = value.to_be_bytes();
         self.registers.sp = self.registers.sp.wrapping_sub(1);
-        bus.write_byte(self.registers.sp, high)?;
+        self.write_byte(bus, self.registers.sp, high)?;
         self.registers.sp = self.registers.sp.wrapping_sub(1);
-        bus.write_byte(self.registers.sp, low)
+        self.write_byte(bus, self.registers.sp, low)
     }
 
-    fn pop_stack(&mut self, bus: &Bus) -> Result<u16> {
-        let low = bus.read_byte(self.registers.sp)?;
+    fn pop_stack(&mut self, bus: &mut Bus) -> Result<u16> {
+        let low = self.read_byte(bus, self.registers.sp)?;
         self.registers.sp = self.registers.sp.wrapping_add(1);
-        let high = bus.read_byte(self.registers.sp)?;
+        let high = self.read_byte(bus, self.registers.sp)?;
         self.registers.sp = self.registers.sp.wrapping_add(1);
         Ok(u16::from_be_bytes([high, low]))
     }
@@ -992,13 +1041,13 @@ impl Cpu {
         Ok(20)
     }
 
-    fn jump_relative(&mut self, bus: &Bus) -> Result<()> {
+    fn jump_relative(&mut self, bus: &mut Bus) -> Result<()> {
         let offset = self.fetch_byte(bus)? as i8;
         self.registers.pc = self.registers.pc.wrapping_add_signed(offset as i16);
         Ok(())
     }
 
-    fn jump_relative_if(&mut self, bus: &Bus, condition: JumpCondition) -> Result<CycleCount> {
+    fn jump_relative_if(&mut self, bus: &mut Bus, condition: JumpCondition) -> Result<CycleCount> {
         let should_jump = match condition {
             JumpCondition::NotZero => !self.registers.flag(Flag::Zero),
             JumpCondition::Zero => self.registers.flag(Flag::Zero),
@@ -1015,7 +1064,7 @@ impl Cpu {
         }
     }
 
-    fn jump_absolute_if(&mut self, bus: &Bus, condition: JumpCondition) -> Result<CycleCount> {
+    fn jump_absolute_if(&mut self, bus: &mut Bus, condition: JumpCondition) -> Result<CycleCount> {
         let address = self.fetch_word(bus)?;
         if self.condition_is_met(condition) {
             self.registers.pc = address;
@@ -1036,7 +1085,7 @@ impl Cpu {
         }
     }
 
-    fn return_if(&mut self, bus: &Bus, condition: JumpCondition) -> Result<CycleCount> {
+    fn return_if(&mut self, bus: &mut Bus, condition: JumpCondition) -> Result<CycleCount> {
         if self.condition_is_met(condition) {
             self.registers.pc = self.pop_stack(bus)?;
             Ok(20)
@@ -1950,6 +1999,27 @@ mod tests {
         assert_eq!(cpu.registers().pc, 1);
         assert_eq!(cpu.step(&mut bus), Ok(4));
         assert_eq!(cpu.registers().pc, 1);
+    }
+
+    #[test]
+    fn halt_bug_repeats_next_opcode_fetch_when_interrupt_is_pending_without_ime() {
+        let mut cpu = Cpu::default();
+        let mut bus = bus_with_program(&[0x76, 0x3C]);
+        bus.write_byte(0xFFFF, 1 << INTERRUPT_JOYPAD)
+            .expect("enable joypad interrupt");
+        bus.request_interrupt(INTERRUPT_JOYPAD);
+
+        assert_eq!(cpu.step(&mut bus), Ok(4));
+        assert_eq!(cpu.mode(), CpuMode::Running);
+        assert_eq!(cpu.registers().pc, 1);
+
+        assert_eq!(cpu.step(&mut bus), Ok(4));
+        assert_eq!(cpu.registers().a, 1);
+        assert_eq!(cpu.registers().pc, 1);
+
+        assert_eq!(cpu.step(&mut bus), Ok(4));
+        assert_eq!(cpu.registers().a, 2);
+        assert_eq!(cpu.registers().pc, 2);
     }
 
     #[test]
