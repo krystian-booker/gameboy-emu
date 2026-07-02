@@ -8,7 +8,7 @@ const DOTS_PER_LINE: u32 = 456;
 const VISIBLE_LINES: u8 = 144;
 const LINES_PER_FRAME: u8 = 154;
 const MODE_2_DOTS: u32 = 80;
-const MODE_3_DOTS: u32 = 252;
+const MODE_3_BASE_DOTS: u32 = 172;
 const VRAM_SIZE: usize = 0x2000;
 const OAM_SIZE: usize = 0xA0;
 const OAM_ENTRY_BYTES: usize = 4;
@@ -122,10 +122,13 @@ impl Ppu {
         }
 
         if self.ly < VISIBLE_LINES {
-            let next_mode = match self.line_dots {
-                0..MODE_2_DOTS => PpuMode::OamScan,
-                MODE_2_DOTS..MODE_3_DOTS => PpuMode::Drawing,
-                _ => PpuMode::HBlank,
+            let mode_3_end_dot = self.mode_3_end_dot();
+            let next_mode = if self.line_dots < MODE_2_DOTS {
+                PpuMode::OamScan
+            } else if self.line_dots < mode_3_end_dot {
+                PpuMode::Drawing
+            } else {
+                PpuMode::HBlank
             };
 
             if next_mode != self.mode {
@@ -367,7 +370,11 @@ impl Ppu {
             0x1800
         };
         let tile_data_unsigned = self.lcdc & 0x10 != 0;
-        let window_x = screen_x.saturating_sub(self.wx.saturating_sub(7) as usize);
+        let window_x = if self.wx < 7 {
+            screen_x + (7 - self.wx) as usize
+        } else {
+            screen_x - (self.wx - 7) as usize
+        };
         self.render_tile_pixel(
             map_base,
             tile_data_unsigned,
@@ -515,6 +522,10 @@ impl Ppu {
     fn stat_interrupt_enabled(&self, bit: u8) -> bool {
         self.stat & (1 << bit) != 0
     }
+
+    fn mode_3_end_dot(&self) -> u32 {
+        MODE_2_DOTS + MODE_3_BASE_DOTS + (self.scx & 0x07) as u32
+    }
 }
 
 fn tile_data_offset(tile_id: u8, unsigned: bool) -> usize {
@@ -535,7 +546,26 @@ mod tests {
     use super::*;
 
     fn advance_to_hblank(ppu: &mut Ppu) {
-        ppu.advance_cycles(MODE_2_DOTS + MODE_3_DOTS);
+        ppu.advance_cycles(ppu.mode_3_end_dot());
+    }
+
+    fn framebuffer_hash(framebuffer: &[u32]) -> u64 {
+        framebuffer
+            .iter()
+            .fold(0xcbf2_9ce4_8422_2325, |hash, pixel| {
+                let hash = hash ^ *pixel as u64;
+                hash.wrapping_mul(0x0000_0100_0000_01B3)
+            })
+    }
+
+    fn write_solid_tile(ppu: &mut Ppu, tile: u8, color_id: u8) {
+        let low = if color_id & 0x01 != 0 { 0xFF } else { 0x00 };
+        let high = if color_id & 0x02 != 0 { 0xFF } else { 0x00 };
+        let base = tile as u16 * TILE_BYTES as u16;
+        for row in 0..8 {
+            ppu.write_vram_raw(base + row * 2, low);
+            ppu.write_vram_raw(base + row * 2 + 1, high);
+        }
     }
 
     #[test]
@@ -598,6 +628,17 @@ mod tests {
 
         assert!(ppu.advance_cycles(80 + 172).stat);
         assert!(ppu.advance_cycles(204).stat);
+    }
+
+    #[test]
+    fn scx_low_bits_extend_drawing_mode() {
+        let mut ppu = Ppu::default();
+        ppu.write_register(0xFF43, 7);
+
+        ppu.advance_cycles(MODE_2_DOTS + MODE_3_BASE_DOTS);
+        assert_eq!(ppu.mode(), PpuMode::Drawing);
+        ppu.advance_cycles(7);
+        assert_eq!(ppu.mode(), PpuMode::HBlank);
     }
 
     #[test]
@@ -716,6 +757,22 @@ mod tests {
         ppu.write_register(0xFF47, 0b11_10_01_00);
         ppu.write_vram_raw(0x1C00, 3);
         ppu.write_vram_raw((TILE_BYTES * 3) as u16, 0x80);
+
+        ppu.advance_cycles(DOTS_PER_LINE);
+
+        assert_eq!(ppu.framebuffer()[0], DMG_COLORS[1]);
+        assert_eq!(ppu.framebuffer()[1], DMG_COLORS[0]);
+    }
+
+    #[test]
+    fn window_with_wx_less_than_seven_starts_partway_into_tile() {
+        let mut ppu = Ppu::default();
+        ppu.write_register(0xFF40, 0xF1);
+        ppu.write_register(0xFF4A, 0);
+        ppu.write_register(0xFF4B, 0);
+        ppu.write_register(0xFF47, 0b11_10_01_00);
+        ppu.write_vram_raw(0x1C00, 1);
+        ppu.write_vram_raw(TILE_BYTES as u16, 0x01);
 
         ppu.advance_cycles(DOTS_PER_LINE);
 
@@ -858,5 +915,58 @@ mod tests {
         ppu.advance_cycles(DOTS_PER_LINE);
 
         assert_eq!(ppu.framebuffer()[10], DMG_COLORS[0]);
+    }
+
+    #[test]
+    fn visual_regression_background_window_and_sprites() {
+        let mut ppu = Ppu::default();
+        ppu.write_register(0xFF40, 0xF3);
+        ppu.write_register(0xFF42, 4);
+        ppu.write_register(0xFF43, 3);
+        ppu.write_register(0xFF4A, 24);
+        ppu.write_register(0xFF4B, 23);
+        ppu.write_register(0xFF47, 0b11_10_01_00);
+        ppu.write_register(0xFF48, 0b11_10_01_00);
+        ppu.write_register(0xFF49, 0b11_10_01_00);
+
+        write_solid_tile(&mut ppu, 1, 1);
+        write_solid_tile(&mut ppu, 2, 2);
+        write_solid_tile(&mut ppu, 3, 3);
+        for index in 0..0x400 {
+            ppu.write_vram_raw(0x1800 + index as u16, if index % 2 == 0 { 1 } else { 2 });
+            ppu.write_vram_raw(0x1C00 + index as u16, 3);
+        }
+
+        ppu.write_oam_raw(0, 40);
+        ppu.write_oam_raw(1, 32);
+        ppu.write_oam_raw(2, 3);
+        ppu.write_oam_raw(3, 0);
+        ppu.write_oam_raw(4, 40);
+        ppu.write_oam_raw(5, 28);
+        ppu.write_oam_raw(6, 2);
+        ppu.write_oam_raw(7, 0x80);
+
+        for _ in 0..VISIBLE_LINES {
+            ppu.advance_cycles(DOTS_PER_LINE);
+        }
+
+        assert_eq!(framebuffer_hash(ppu.framebuffer()), 0x9a26_f37f_2123_4965);
+    }
+
+    #[test]
+    fn visual_regression_bg_disabled_sprite_priority_is_ignored() {
+        let mut ppu = Ppu::default();
+        ppu.write_register(0xFF40, 0x92);
+        ppu.write_register(0xFF48, 0b11_10_01_00);
+        write_solid_tile(&mut ppu, 1, 3);
+        ppu.write_oam_raw(0, 16);
+        ppu.write_oam_raw(1, 8);
+        ppu.write_oam_raw(2, 1);
+        ppu.write_oam_raw(3, 0x80);
+
+        ppu.advance_cycles(DOTS_PER_LINE);
+
+        assert_eq!(ppu.framebuffer()[0], DMG_COLORS[3]);
+        assert_eq!(framebuffer_hash(ppu.framebuffer()), 0xfe44_45db_b72e_5b0d);
     }
 }
