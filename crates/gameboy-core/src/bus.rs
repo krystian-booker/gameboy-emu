@@ -32,6 +32,13 @@ const TAC: u16 = 0xFF07;
 const INTERRUPT_FLAG: u16 = 0xFF0F;
 const DMA: u16 = 0xFF46;
 const KEY1: u16 = 0xFF4D;
+const VBK: u16 = 0xFF4F;
+const HDMA1: u16 = 0xFF51;
+const HDMA2: u16 = 0xFF52;
+const HDMA3: u16 = 0xFF53;
+const HDMA4: u16 = 0xFF54;
+const HDMA5: u16 = 0xFF55;
+const SVBK: u16 = 0xFF70;
 const HRAM_START: u16 = 0xFF80;
 const HRAM_END: u16 = 0xFFFE;
 const INTERRUPT_ENABLE: u16 = 0xFFFF;
@@ -66,6 +73,17 @@ struct CgbState {
     enabled: bool,
     double_speed: bool,
     prepare_speed_switch: bool,
+    svbk: u8,
+    div_remainder: u32,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct HdmaState {
+    source: u16,
+    dest: u16,
+    remaining_blocks: u8,
+    hblank_mode: bool,
+    active: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -81,7 +99,7 @@ struct DmaState {
 pub struct Bus {
     cartridge: Option<Cartridge>,
     eram: MemoryRegion<0x2000>,
-    wram: MemoryRegion<0x2000>,
+    wram: [MemoryRegion<0x1000>; 8],
     io: MemoryRegion<0x80>,
     hram: MemoryRegion<0x7F>,
     interrupt_enable: u8,
@@ -89,9 +107,11 @@ pub struct Bus {
     joypad: Joypad,
     serial: Serial,
     cgb: CgbState,
+    hdma: HdmaState,
     apu: Apu,
     dma: DmaState,
     ppu: Ppu,
+    prev_ppu_mode: PpuMode,
 }
 
 impl Bus {
@@ -112,7 +132,15 @@ impl Bus {
             cartridge.advance_cycles(cycles);
         }
 
-        self.apu.advance_cycles(cycles);
+        let display_cycles = if self.cgb.double_speed {
+            let total = cycles + self.cgb.div_remainder;
+            self.cgb.div_remainder = total & 1;
+            total / 2
+        } else {
+            cycles
+        };
+
+        self.apu.advance_cycles(display_cycles);
         self.advance_dma(cycles);
 
         self.timer.div_cycles += cycles;
@@ -136,13 +164,23 @@ impl Bus {
             }
         }
 
-        let ppu_interrupts = self.ppu.advance_cycles(cycles);
+        let ppu_interrupts = self.ppu.advance_cycles(display_cycles);
         if ppu_interrupts.vblank {
             self.request_interrupt(INTERRUPT_VBLANK);
         }
         if ppu_interrupts.stat {
             self.request_interrupt(INTERRUPT_LCD_STAT);
         }
+
+        let mode_after = self.ppu.mode();
+        if self.hdma.active
+            && self.hdma.hblank_mode
+            && self.prev_ppu_mode != PpuMode::HBlank
+            && mode_after == PpuMode::HBlank
+        {
+            self.hdma_transfer_block();
+        }
+        self.prev_ppu_mode = mode_after;
     }
 
     pub fn request_interrupt(&mut self, bit: u8) {
@@ -197,6 +235,9 @@ impl Bus {
         self.cgb.enabled = enabled;
         self.cgb.double_speed = false;
         self.cgb.prepare_speed_switch = false;
+        self.cgb.svbk = 0;
+        self.cgb.div_remainder = 0;
+        self.ppu.set_cgb(enabled);
     }
 
     pub fn stop(&mut self) -> bool {
@@ -206,6 +247,15 @@ impl Bus {
             true
         } else {
             false
+        }
+    }
+
+    fn wram_slot(&self, offset: usize) -> (usize, usize) {
+        if offset < 0x1000 {
+            (0, offset)
+        } else {
+            let bank = (self.cgb.svbk as usize & 0x07).max(1);
+            (bank, offset - 0x1000)
         }
     }
 
@@ -229,14 +279,18 @@ impl Bus {
                 .as_ref()
                 .and_then(|cart| cart.read_ram(address - ERAM_START))
                 .ok_or(EmulatorError::InvalidMemoryAccess { address }),
-            WRAM_START..=WRAM_END => self
-                .wram
-                .read((address - WRAM_START) as usize)
-                .ok_or(EmulatorError::InvalidMemoryAccess { address }),
-            ECHO_RAM_START..=ECHO_RAM_END => self
-                .wram
-                .read((address - ECHO_RAM_START) as usize)
-                .ok_or(EmulatorError::InvalidMemoryAccess { address }),
+            WRAM_START..=WRAM_END => {
+                let (bank, offset) = self.wram_slot((address - WRAM_START) as usize);
+                self.wram[bank]
+                    .read(offset)
+                    .ok_or(EmulatorError::InvalidMemoryAccess { address })
+            }
+            ECHO_RAM_START..=ECHO_RAM_END => {
+                let (bank, offset) = self.wram_slot((address - ECHO_RAM_START) as usize);
+                self.wram[bank]
+                    .read(offset)
+                    .ok_or(EmulatorError::InvalidMemoryAccess { address })
+            }
             OAM_START..=OAM_END => self
                 .ppu
                 .read_oam(address - OAM_START)
@@ -256,11 +310,17 @@ impl Bus {
                 .ok_or(EmulatorError::InvalidMemoryAccess { address }),
             INTERRUPT_FLAG => Ok(self.interrupt_flag() | 0xE0),
             KEY1 => Ok(self.cgb.read_key1()),
-            0xFF40..=0xFF4B => self
+            0xFF40..=0xFF4B | VBK | 0xFF68..=0xFF6B => self
                 .ppu
                 .read_register(address)
                 .or_else(|| self.io.read((address - IO_START) as usize))
                 .ok_or(EmulatorError::InvalidMemoryAccess { address }),
+            HDMA1..=HDMA5 => Ok(self.read_hdma(address)),
+            SVBK => Ok(if self.cgb.enabled {
+                0xF8 | (self.cgb.svbk & 0x07)
+            } else {
+                0xFF
+            }),
             IO_START..=IO_END => self
                 .io
                 .read((address - IO_START) as usize)
@@ -296,9 +356,13 @@ impl Bus {
                     false
                 }
             }
-            WRAM_START..=WRAM_END => self.wram.write((address - WRAM_START) as usize, value),
+            WRAM_START..=WRAM_END => {
+                let (bank, offset) = self.wram_slot((address - WRAM_START) as usize);
+                self.wram[bank].write(offset, value)
+            }
             ECHO_RAM_START..=ECHO_RAM_END => {
-                self.wram.write((address - ECHO_RAM_START) as usize, value)
+                let (bank, offset) = self.wram_slot((address - ECHO_RAM_START) as usize);
+                self.wram[bank].write(offset, value)
             }
             OAM_START..=OAM_END => self.ppu.write_oam(address - OAM_START, value),
             UNUSABLE_START..=UNUSABLE_END => true,
@@ -346,7 +410,7 @@ impl Bus {
                 self.start_dma(value);
                 wrote
             }
-            0xFF40..=0xFF4B => {
+            0xFF40..=0xFF4B | VBK | 0xFF68..=0xFF6B => {
                 if self.ppu.write_register(address, value) {
                     true
                 } else {
@@ -355,6 +419,16 @@ impl Bus {
             }
             KEY1 => {
                 self.cgb.write_key1(value);
+                true
+            }
+            HDMA1..=HDMA5 => {
+                self.write_hdma(address, value);
+                true
+            }
+            SVBK => {
+                if self.cgb.enabled {
+                    self.cgb.svbk = value & 0x07;
+                }
                 true
             }
             IO_START..=IO_END => self.io.write((address - IO_START) as usize, value),
@@ -429,6 +503,64 @@ impl Bus {
         }
     }
 
+    fn write_hdma(&mut self, address: u16, value: u8) {
+        match address {
+            HDMA1 => self.hdma.source = (self.hdma.source & 0x00FF) | ((value as u16) << 8),
+            HDMA2 => self.hdma.source = (self.hdma.source & 0xFF00) | (value as u16 & 0xF0),
+            HDMA3 => {
+                self.hdma.dest = 0x8000 | ((value as u16 & 0x1F) << 8) | (self.hdma.dest & 0x00F0)
+            }
+            HDMA4 => self.hdma.dest = (self.hdma.dest & 0xFF00) | (value as u16 & 0xF0),
+            HDMA5 => self.start_hdma(value),
+            _ => {}
+        }
+    }
+
+    fn read_hdma(&self, address: u16) -> u8 {
+        if address == HDMA5 && self.hdma.active && self.hdma.hblank_mode {
+            self.hdma.remaining_blocks.wrapping_sub(1) & 0x7F
+        } else {
+            0xFF
+        }
+    }
+
+    fn start_hdma(&mut self, value: u8) {
+        let blocks = (value & 0x7F) + 1;
+
+        if value & 0x80 != 0 {
+            self.hdma.remaining_blocks = blocks;
+            self.hdma.hblank_mode = true;
+            self.hdma.active = true;
+        } else if self.hdma.active && self.hdma.hblank_mode {
+            self.hdma.active = false;
+            self.hdma.hblank_mode = false;
+        } else {
+            self.hdma.remaining_blocks = blocks;
+            self.hdma.hblank_mode = false;
+            self.hdma.active = true;
+            while self.hdma.active {
+                self.hdma_transfer_block();
+            }
+        }
+    }
+
+    fn hdma_transfer_block(&mut self) {
+        let bank = self.ppu.vram_bank() as usize;
+        for i in 0..0x10 {
+            let byte = self.dma_read_byte(self.hdma.source.wrapping_add(i));
+            let dest = self.hdma.dest.wrapping_add(i) & 0x1FFF;
+            self.ppu.write_vram_bank_raw(bank, dest, byte);
+        }
+
+        self.hdma.source = self.hdma.source.wrapping_add(0x10);
+        self.hdma.dest = self.hdma.dest.wrapping_add(0x10);
+        self.hdma.remaining_blocks = self.hdma.remaining_blocks.saturating_sub(1);
+        if self.hdma.remaining_blocks == 0 {
+            self.hdma.active = false;
+            self.hdma.hblank_mode = false;
+        }
+    }
+
     fn dma_blocks_cpu_access(&self, address: u16) -> bool {
         self.dma.active && self.dma.startup_cycles == 0 && !matches!(address, HRAM_START..=HRAM_END)
     }
@@ -446,14 +578,14 @@ impl Bus {
                 .as_ref()
                 .and_then(|cart| cart.read_ram(address - ERAM_START))
                 .unwrap_or(0xFF),
-            WRAM_START..=WRAM_END => self
-                .wram
-                .read((address - WRAM_START) as usize)
-                .unwrap_or(0xFF),
-            ECHO_RAM_START..=ECHO_RAM_END => self
-                .wram
-                .read((address - ECHO_RAM_START) as usize)
-                .unwrap_or(0xFF),
+            WRAM_START..=WRAM_END => {
+                let (bank, offset) = self.wram_slot((address - WRAM_START) as usize);
+                self.wram[bank].read(offset).unwrap_or(0xFF)
+            }
+            ECHO_RAM_START..=ECHO_RAM_END => {
+                let (bank, offset) = self.wram_slot((address - ECHO_RAM_START) as usize);
+                self.wram[bank].read(offset).unwrap_or(0xFF)
+            }
             OAM_START..=OAM_END => self.ppu.read_oam_raw(address - OAM_START).unwrap_or(0xFF),
             UNUSABLE_START..=UNUSABLE_END => 0xFF,
             DIV => self.timer.div,
@@ -925,5 +1057,88 @@ mod tests {
         bus.write_byte(0x0000, 0x0A).expect("enable ram");
         bus.write_byte(0xA000, 0x5A).expect("write ram");
         assert_eq!(bus.read_byte(0xA000), Ok(0x5A));
+    }
+
+    #[test]
+    fn cgb_wram_banks_switch_with_svbk() {
+        let mut bus = Bus::default();
+        bus.set_cgb_mode(true);
+
+        bus.write_byte(0xD000, 0x11).expect("write bank 1");
+        bus.write_byte(0xFF70, 2).expect("select bank 2");
+        bus.write_byte(0xD000, 0x22).expect("write bank 2");
+        assert_eq!(bus.read_byte(0xD000), Ok(0x22));
+
+        bus.write_byte(0xFF70, 1).expect("select bank 1");
+        assert_eq!(bus.read_byte(0xD000), Ok(0x11));
+        assert_eq!(bus.read_byte(0xFF70), Ok(0xF9));
+
+        bus.write_byte(0xC000, 0x33).expect("write bank 0");
+        bus.write_byte(0xFF70, 5).expect("select bank 5");
+        assert_eq!(bus.read_byte(0xC000), Ok(0x33));
+    }
+
+    #[test]
+    fn cgb_general_hdma_copies_immediately_to_vram() {
+        let mut bus = Bus::default();
+        bus.set_cgb_mode(true);
+        for i in 0..0x10u16 {
+            bus.write_byte(0xC000 + i, (i + 1) as u8).expect("seed wram");
+        }
+
+        bus.write_byte(0xFF51, 0xC0).expect("src high");
+        bus.write_byte(0xFF52, 0x00).expect("src low");
+        bus.write_byte(0xFF53, 0x00).expect("dst high");
+        bus.write_byte(0xFF54, 0x00).expect("dst low");
+        bus.write_byte(0xFF55, 0x00).expect("start hdma");
+
+        for i in 0..0x10u16 {
+            assert_eq!(bus.read_byte(0x8000 + i), Ok((i + 1) as u8));
+        }
+        assert_eq!(bus.read_byte(0xFF55), Ok(0xFF));
+    }
+
+    #[test]
+    fn cgb_hblank_hdma_transfers_one_block_per_hblank() {
+        let mut bus = Bus::default();
+        bus.set_cgb_mode(true);
+        for i in 0..0x20u16 {
+            bus.write_byte(0xC000 + i, (i + 1) as u8).expect("seed wram");
+        }
+
+        bus.write_byte(0xFF51, 0xC0).expect("src high");
+        bus.write_byte(0xFF52, 0x00).expect("src low");
+        bus.write_byte(0xFF53, 0x00).expect("dst high");
+        bus.write_byte(0xFF54, 0x00).expect("dst low");
+        bus.write_byte(0xFF55, 0x81).expect("start hblank hdma");
+
+        for _ in 0..(456 * 3 / 4) {
+            bus.advance_cycles(4);
+        }
+
+        assert_eq!(bus.read_byte(0x8000), Ok(0x01));
+        assert_eq!(bus.read_byte(0x8010), Ok(0x11));
+        assert_eq!(bus.read_byte(0xFF55), Ok(0xFF));
+    }
+
+    #[test]
+    fn cgb_double_speed_halves_ppu_progress() {
+        let mut single = Bus::default();
+        single.set_cgb_mode(true);
+
+        let mut double = Bus::default();
+        double.set_cgb_mode(true);
+        double.write_byte(0xFF4D, 0x01).expect("arm speed switch");
+        assert!(double.stop());
+        assert_eq!(double.read_byte(0xFF4D), Ok(0xFE));
+
+        for _ in 0..(912 / 4) {
+            single.advance_cycles(4);
+            double.advance_cycles(4);
+        }
+
+        assert_eq!(single.read_byte(0xFF44), Ok(2));
+        assert_eq!(double.read_byte(0xFF44), Ok(1));
+        assert_eq!(single.read_byte(0xFF04), double.read_byte(0xFF04));
     }
 }

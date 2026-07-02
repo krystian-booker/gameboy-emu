@@ -27,7 +27,7 @@ impl Emulator {
 
     pub fn load_rom(&mut self, bytes: Vec<u8>) -> Result<()> {
         let cartridge = Cartridge::from_bytes(bytes)?;
-        let cgb_mode = cartridge.header().requires_cgb();
+        let cgb_mode = cartridge.header().supports_cgb();
         self.bus.insert_cartridge(cartridge);
         self.bus.set_cgb_mode(cgb_mode);
         self.cpu = if cgb_mode {
@@ -160,6 +160,30 @@ mod tests {
             emulator.step(),
             Err(EmulatorError::InvalidMemoryAccess { address: 0x0100 })
         );
+    }
+
+    #[test]
+    fn cgb_cartridge_enables_color_mode() {
+        let mut rom = synthetic_rom("CGBTEST", &[(0x0100, &[0x00])]);
+        rom[0x0143] = 0xC0;
+
+        let mut emulator = Emulator::new();
+        emulator.load_rom(rom).expect("load ROM");
+
+        assert_eq!(emulator.registers().af() & 0xFF00, 0x1100);
+        assert_eq!(emulator.bus().read_byte(0xFF70), Ok(0xF8));
+        assert_eq!(emulator.bus().read_byte(0xFF4F), Ok(0xFE));
+    }
+
+    #[test]
+    fn dmg_compatible_cartridge_flag_enables_color_mode() {
+        let mut rom = synthetic_rom("DMGCOMPAT", &[(0x0100, &[0x00])]);
+        rom[0x0143] = 0x80;
+
+        let mut emulator = Emulator::new();
+        emulator.load_rom(rom).expect("load ROM");
+
+        assert_eq!(emulator.bus().read_byte(0xFF4F), Ok(0xFE));
     }
 
     #[test]

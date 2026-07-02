@@ -16,25 +16,17 @@ use crate::{
     theme,
 };
 
-/// ~59.7 Hz DMG refresh, used to pace the emulator when no audio device is
-/// available to drive timing.
 const FRAME_TIME: Duration = Duration::from_nanos(16_742_706);
-/// Cap on frames run per UI tick so a stalled UI can't cause an unbounded
-/// catch-up spike.
 const MAX_FRAMES_PER_TICK: u32 = 8;
 
 const ERROR_COLOR: Color32 = Color32::from_rgb(224, 96, 96);
 
-/// Which screen the app is currently showing.
 enum Screen {
     SetupRomDir,
-    /// The library / game list. A ROM may still be loaded (paused) in the
-    /// background, in which case it can be resumed from here.
     Menu,
     Playing,
 }
 
-/// State of the (background) ROM directory scan.
 enum ScanState {
     Idle,
     Scanning(mpsc::Receiver<ScanResult>),
@@ -42,8 +34,6 @@ enum ScanState {
     Error(String),
 }
 
-/// Deferred actions produced while rendering the menu, applied after the egui
-/// closures release their borrows of `self`.
 #[derive(Default)]
 struct MenuActions {
     open_browser: bool,
@@ -58,14 +48,11 @@ pub struct App {
     browser: DirBrowser,
     scan: ScanState,
     session: Option<Session>,
-    /// The ROM currently loaded into `session` (running or paused).
     current: Option<RomEntry>,
     controls: Vec<ControlBinding>,
     gilrs: Option<Gilrs>,
     texture: Option<egui::TextureHandle>,
-    /// Reusable RGBA scratch buffer for uploading the GB framebuffer.
     rgba: Vec<u8>,
-    /// Last non-fatal error, surfaced in the UI.
     error: Option<String>,
 }
 
@@ -90,7 +77,6 @@ impl App {
             config,
         };
 
-        // If a valid ROM directory was remembered, go straight to the list.
         if let Some(dir) = app.config.rom_dir.clone() {
             if dir.is_dir() {
                 app.start_scan(dir);
@@ -105,7 +91,6 @@ impl App {
         self.scan = ScanState::Scanning(spawn_scan(dir));
     }
 
-    /// Persists the running ROM's saves without tearing down the session.
     fn flush_saves(&mut self) {
         if let Some(session) = &self.session {
             if let Err(err) = session.persist_saves() {
@@ -114,8 +99,6 @@ impl App {
         }
     }
 
-    /// Escape during play: keep the ROM loaded but stop advancing it, and return
-    /// to the library where it can be resumed.
     fn pause(&mut self) {
         self.flush_saves();
         self.screen = Screen::Menu;
@@ -127,7 +110,6 @@ impl App {
         }
     }
 
-    /// Fully unloads the current ROM (flushing saves) and stays in the library.
     fn stop(&mut self) {
         self.flush_saves();
         self.session = None;
@@ -138,9 +120,7 @@ impl App {
         self.screen = Screen::Menu;
     }
 
-    /// Loads `entry` into a fresh session, replacing any ROM already loaded.
     fn launch(&mut self, entry: RomEntry) {
-        // Save and drop any ROM that's currently loaded before switching.
         self.flush_saves();
         self.session = None;
         self.current = None;
@@ -169,8 +149,6 @@ impl App {
             .as_ref()
             .is_some_and(|current| current.path == entry.path)
     }
-
-    // ---- screens ---------------------------------------------------------
 
     fn ui_setup(&mut self, ui: &mut egui::Ui) {
         egui::Panel::top("setup_header").show(ui, |ui| {
@@ -202,7 +180,6 @@ impl App {
     fn ui_menu(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
 
-        // Advance a running scan.
         if let ScanState::Scanning(rx) = &self.scan {
             match rx.try_recv() {
                 Ok(Ok(entries)) => self.scan = ScanState::Ready(entries),
@@ -242,7 +219,6 @@ impl App {
                 ui.add_space(6.0);
             }
 
-            // "Now Playing" banner for a paused/loaded ROM.
             if self.session.is_some() {
                 self.now_playing_card(ui, &mut actions);
                 ui.add_space(10.0);
@@ -284,7 +260,6 @@ impl App {
             }
         });
 
-        // Apply deferred actions now that borrows are released.
         if actions.open_browser {
             self.open_browser();
         } else if actions.stop {
@@ -345,7 +320,6 @@ impl App {
     fn ui_playing(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
 
-        // Escape pauses (keeps the ROM loaded) and returns to the library.
         if ctx.input(|i| i.key_pressed(Key::Escape)) {
             self.pause();
             return;
@@ -367,7 +341,6 @@ impl App {
                 }
                 ran += 1;
                 if !has_audio {
-                    // Without an audio clock, run exactly one frame per tick.
                     break;
                 }
             }
@@ -376,8 +349,6 @@ impl App {
         self.upload_frame(&ctx);
         self.draw_screen(ui);
 
-        // Keep frames flowing: poll the audio drain frequently, or pace off the
-        // wall clock when there's no audio device.
         if has_audio {
             ctx.request_repaint_after(Duration::from_millis(1));
         } else {
@@ -385,11 +356,6 @@ impl App {
         }
     }
 
-    // ---- rendering -------------------------------------------------------
-
-    /// Converts the GB framebuffer (ARGB `0xAARRGGBB`) into the reusable RGBA
-    /// buffer and uploads it to the GPU texture (nearest-neighbor for crisp
-    /// pixels), reusing the same texture handle across frames.
     fn upload_frame(&mut self, ctx: &egui::Context) {
         let Some(session) = self.session.as_ref() else {
             return;
@@ -399,10 +365,10 @@ impl App {
             .iter()
             .zip(self.rgba.chunks_exact_mut(4))
         {
-            out[0] = (pixel >> 16) as u8; // R
-            out[1] = (pixel >> 8) as u8; // G
-            out[2] = *pixel as u8; // B
-            out[3] = 0xFF; // A (force opaque)
+            out[0] = (pixel >> 16) as u8;
+            out[1] = (pixel >> 8) as u8;
+            out[2] = *pixel as u8;
+            out[3] = 0xFF;
         }
 
         let image =
@@ -432,7 +398,6 @@ impl App {
                 let image_rect = egui::Rect::from_center_size(rect.center(), size);
                 egui::Image::new(SizedTexture::new(texture.id(), size)).paint_at(ui, image_rect);
 
-                // Subtle hint at the bottom.
                 ui.painter().text(
                     pos2(rect.center().x, rect.bottom() - 10.0),
                     Align2::CENTER_BOTTOM,
@@ -464,8 +429,6 @@ impl eframe::App for App {
     }
 }
 
-/// Renders one ROM as a modern full-width card (title, metadata, GB/GBC badge)
-/// and returns its click response. The currently-loaded ROM is highlighted.
 fn rom_row(ui: &mut egui::Ui, entry: &RomEntry, is_current: bool) -> egui::Response {
     let height = 56.0;
     let (rect, response) =
