@@ -1,8 +1,10 @@
 use crate::{
     cartridge::Cartridge,
     error::{EmulatorError, Result},
+    joypad::JoypadState,
     memory::MemoryRegion,
     ppu::{Ppu, PpuMode},
+    serial::Serial,
 };
 
 const VRAM_START: u16 = 0x8000;
@@ -19,6 +21,9 @@ const UNUSABLE_START: u16 = 0xFEA0;
 const UNUSABLE_END: u16 = 0xFEFF;
 const IO_START: u16 = 0xFF00;
 const IO_END: u16 = 0xFF7F;
+const JOYPAD: u16 = 0xFF00;
+const SERIAL_DATA: u16 = 0xFF01;
+const SERIAL_CONTROL: u16 = 0xFF02;
 const DIV: u16 = 0xFF04;
 const TIMA: u16 = 0xFF05;
 const TMA: u16 = 0xFF06;
@@ -45,6 +50,12 @@ struct Timer {
     tima_cycles: u32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Joypad {
+    select: u8,
+    state: JoypadState,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Bus {
     cartridge: Option<Cartridge>,
@@ -54,6 +65,8 @@ pub struct Bus {
     hram: MemoryRegion<0x7F>,
     interrupt_enable: u8,
     timer: Timer,
+    joypad: Joypad,
+    serial: Serial,
     ppu: Ppu,
 }
 
@@ -123,6 +136,24 @@ impl Bus {
         self.ppu.take_frame_ready()
     }
 
+    pub fn set_joypad_state(&mut self, state: JoypadState) {
+        let old_value = self.joypad.read();
+        self.joypad.set_state(state);
+        let new_value = self.joypad.read();
+
+        if old_value & !new_value & 0x0F != 0 {
+            self.request_interrupt(INTERRUPT_JOYPAD);
+        }
+    }
+
+    pub fn joypad_state(&self) -> JoypadState {
+        self.joypad.state()
+    }
+
+    pub fn take_serial_output(&mut self) -> Vec<u8> {
+        self.serial.drain_output()
+    }
+
     pub fn read_byte(&self, address: u16) -> Result<u8> {
         match address {
             0x0000..=0x7FFF => self
@@ -156,6 +187,9 @@ impl Bus {
             TIMA => Ok(self.timer.tima),
             TMA => Ok(self.timer.tma),
             TAC => Ok(self.timer.tac | 0xF8),
+            JOYPAD => Ok(self.joypad.read()),
+            SERIAL_DATA => Ok(self.serial.read_data()),
+            SERIAL_CONTROL => Ok(self.serial.read_control()),
             INTERRUPT_FLAG => Ok(self.interrupt_flag() | 0xE0),
             0xFF40..=0xFF4B => self
                 .ppu
@@ -215,6 +249,20 @@ impl Bus {
             TAC => {
                 self.timer.tac = value & 0b111;
                 self.timer.tima_cycles = 0;
+                true
+            }
+            JOYPAD => {
+                self.joypad.write(value);
+                true
+            }
+            SERIAL_DATA => {
+                self.serial.write_data(value);
+                true
+            }
+            SERIAL_CONTROL => {
+                if self.serial.write_control(value) {
+                    self.request_interrupt(INTERRUPT_SERIAL);
+                }
                 true
             }
             INTERRUPT_FLAG => self
@@ -295,6 +343,9 @@ impl Bus {
             TIMA => self.timer.tima,
             TMA => self.timer.tma,
             TAC => self.timer.tac | 0xF8,
+            JOYPAD => self.joypad.read(),
+            SERIAL_DATA => self.serial.read_data(),
+            SERIAL_CONTROL => self.serial.read_control(),
             INTERRUPT_FLAG => self.interrupt_flag() | 0xE0,
             0xFF40..=0xFF4B => self
                 .ppu
@@ -311,6 +362,42 @@ impl Bus {
     }
 }
 
+impl Default for Joypad {
+    fn default() -> Self {
+        Self {
+            select: 0x30,
+            state: JoypadState::default(),
+        }
+    }
+}
+
+impl Joypad {
+    fn read(&self) -> u8 {
+        let mut lower = 0x0F;
+
+        if self.select & 0x10 == 0 {
+            lower &= self.state.direction_nibble();
+        }
+        if self.select & 0x20 == 0 {
+            lower &= self.state.action_nibble();
+        }
+
+        0xC0 | self.select | lower
+    }
+
+    fn write(&mut self, value: u8) {
+        self.select = value & 0x30;
+    }
+
+    fn set_state(&mut self, state: JoypadState) {
+        self.state = state;
+    }
+
+    fn state(&self) -> JoypadState {
+        self.state
+    }
+}
+
 fn timer_period(tac: u8) -> u32 {
     match tac & 0b11 {
         0b00 => 1024,
@@ -324,7 +411,10 @@ fn timer_period(tac: u8) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cartridge::synthetic_rom;
+    use crate::{
+        cartridge::synthetic_rom,
+        joypad::{JoypadButton, JoypadState},
+    };
 
     #[test]
     fn reads_from_cartridge_rom() {
@@ -362,14 +452,92 @@ mod tests {
 
         bus.write_byte(0xFF40, 0x00).expect("disable lcd");
         bus.write_byte(0xFE00, 0x12).expect("write oam");
-        bus.write_byte(0xFF00, 0x34).expect("write io");
+        bus.write_byte(0xFF03, 0x34).expect("write io");
         bus.write_byte(0xFF80, 0x56).expect("write hram");
         bus.write_byte(0xFFFF, 0x1F).expect("write ie");
 
         assert_eq!(bus.read_byte(0xFE00), Ok(0x12));
-        assert_eq!(bus.read_byte(0xFF00), Ok(0x34));
+        assert_eq!(bus.read_byte(0xFF03), Ok(0x34));
         assert_eq!(bus.read_byte(0xFF80), Ok(0x56));
         assert_eq!(bus.read_byte(0xFFFF), Ok(0x1F));
+    }
+
+    #[test]
+    fn joypad_register_reads_selected_active_low_button_group() {
+        let mut bus = Bus::default();
+        let state = JoypadState::new()
+            .with(JoypadButton::Right, true)
+            .with(JoypadButton::Left, true)
+            .with(JoypadButton::A, true)
+            .with(JoypadButton::Start, true);
+
+        bus.set_joypad_state(state);
+        assert_eq!(bus.read_byte(JOYPAD), Ok(0xFF));
+
+        bus.write_byte(JOYPAD, 0x20).expect("select directions");
+        assert_eq!(bus.read_byte(JOYPAD), Ok(0xEC));
+
+        bus.write_byte(JOYPAD, 0x10).expect("select actions");
+        assert_eq!(bus.read_byte(JOYPAD), Ok(0xD6));
+
+        bus.write_byte(JOYPAD, 0x00).expect("select both");
+        assert_eq!(bus.read_byte(JOYPAD), Ok(0xC4));
+    }
+
+    #[test]
+    fn joypad_newly_pressed_selected_button_requests_interrupt() {
+        let mut bus = Bus::default();
+        bus.write_byte(JOYPAD, 0x20).expect("select directions");
+
+        bus.set_joypad_state(JoypadState::new().with(JoypadButton::Right, true));
+        assert_eq!(bus.read_byte(INTERRUPT_FLAG), Ok(0xF0));
+
+        bus.write_byte(INTERRUPT_FLAG, 0).expect("clear if");
+        bus.set_joypad_state(JoypadState::new().with(JoypadButton::Right, true));
+        assert_eq!(bus.read_byte(INTERRUPT_FLAG), Ok(0xE0));
+    }
+
+    #[test]
+    fn joypad_pressed_unselected_button_does_not_request_interrupt_until_selected_press_changes() {
+        let mut bus = Bus::default();
+        bus.write_byte(JOYPAD, 0x20).expect("select directions");
+
+        bus.set_joypad_state(JoypadState::new().with(JoypadButton::A, true));
+        assert_eq!(bus.read_byte(INTERRUPT_FLAG), Ok(0xE0));
+
+        bus.set_joypad_state(
+            JoypadState::new()
+                .with(JoypadButton::A, true)
+                .with(JoypadButton::Up, true),
+        );
+        assert_eq!(bus.read_byte(INTERRUPT_FLAG), Ok(0xF0));
+    }
+
+    #[test]
+    fn serial_internal_clock_transfer_logs_byte_and_requests_interrupt() {
+        let mut bus = Bus::default();
+
+        bus.write_byte(SERIAL_DATA, b'A').expect("write sb");
+        bus.write_byte(SERIAL_CONTROL, 0x81).expect("start serial");
+
+        assert_eq!(bus.read_byte(SERIAL_DATA), Ok(b'A'));
+        assert_eq!(bus.read_byte(SERIAL_CONTROL), Ok(0x7F));
+        assert_eq!(bus.read_byte(INTERRUPT_FLAG), Ok(0xE8));
+        assert_eq!(bus.take_serial_output(), b"A".to_vec());
+        assert!(bus.take_serial_output().is_empty());
+    }
+
+    #[test]
+    fn serial_external_clock_transfer_does_not_log_without_peer() {
+        let mut bus = Bus::default();
+
+        bus.write_byte(SERIAL_DATA, b'B').expect("write sb");
+        bus.write_byte(SERIAL_CONTROL, 0x80)
+            .expect("start external serial");
+
+        assert_eq!(bus.read_byte(SERIAL_CONTROL), Ok(0xFE));
+        assert_eq!(bus.read_byte(INTERRUPT_FLAG), Ok(0xE0));
+        assert!(bus.take_serial_output().is_empty());
     }
 
     #[test]

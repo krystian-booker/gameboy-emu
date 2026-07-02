@@ -3,10 +3,12 @@ use crate::{
     cartridge::Cartridge,
     cpu::{Cpu, Registers},
     error::Result,
+    joypad::JoypadState,
     ppu::PpuMode,
 };
 
 pub type CycleCount = u32;
+pub const DOTS_PER_FRAME: CycleCount = 456 * 154;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Emulator {
@@ -35,6 +37,19 @@ impl Emulator {
         Ok(cycles)
     }
 
+    pub fn run_frame(&mut self) -> Result<CycleCount> {
+        let mut elapsed = 0;
+
+        while elapsed < DOTS_PER_FRAME {
+            elapsed += self.step()?;
+            if self.take_frame_ready() {
+                break;
+            }
+        }
+
+        Ok(elapsed)
+    }
+
     pub fn registers(&self) -> &Registers {
         self.cpu.registers()
     }
@@ -53,6 +68,18 @@ impl Emulator {
 
     pub fn take_frame_ready(&mut self) -> bool {
         self.bus.take_frame_ready()
+    }
+
+    pub fn set_joypad_state(&mut self, state: JoypadState) {
+        self.bus.set_joypad_state(state);
+    }
+
+    pub fn joypad_state(&self) -> JoypadState {
+        self.bus.joypad_state()
+    }
+
+    pub fn take_serial_output(&mut self) -> Vec<u8> {
+        self.bus.take_serial_output()
     }
 }
 
@@ -164,6 +191,18 @@ mod tests {
         assert_eq!(emulator.ppu_mode(), PpuMode::VBlank);
         assert_eq!(emulator.bus().read_byte(0xFF0F), Ok(0xE1));
         assert!(emulator.take_frame_ready());
+        assert!(!emulator.take_frame_ready());
+    }
+
+    #[test]
+    fn run_frame_steps_until_framebuffer_is_ready() {
+        let mut emulator = Emulator::new();
+        emulator
+            .load_rom(synthetic_rom("TEST", &[(0x0100, &[0x00])]))
+            .expect("load ROM");
+
+        assert_eq!(emulator.run_frame(), Ok(456 * 144));
+        assert_eq!(emulator.bus().read_byte(0xFF44), Ok(144));
         assert!(!emulator.take_frame_ready());
     }
 
