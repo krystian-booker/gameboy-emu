@@ -5,6 +5,7 @@ edition = "2021"
 license = "MIT"
 
 [dependencies]
+cpal = "0.15"
 gilrs = "0.11"
 gameboy-core = { path = "../gameboy-core" }
 minifb = "0.27"

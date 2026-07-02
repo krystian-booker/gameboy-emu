@@ -13,6 +13,9 @@ use gameboy_core::{
 use gilrs::{Axis, Button, Gilrs};
 use minifb::{Key, Scale, Window, WindowOptions};
 
+mod audio;
+use audio::AudioOutput;
+
 const DMG_REFRESH_RATE_HZ: f64 = 4_194_304.0 / (456.0 * 154.0);
 const FRAME_TIME: Duration = Duration::from_nanos((1_000_000_000.0 / DMG_REFRESH_RATE_HZ) as u64);
 const ANALOG_DEADZONE: f32 = 0.5;
@@ -111,6 +114,11 @@ fn main() {
     let controls = default_controls();
     let mut gilrs = Gilrs::new().ok();
 
+    let mut audio = AudioOutput::new();
+    if audio.is_none() {
+        eprintln!("no audio output available; running without sound");
+    }
+
     while window.is_open() && !window.is_key_down(Key::Escape) {
         let frame_start = Instant::now();
         emulator.set_joypad_state(read_joypad_state(&window, gilrs.as_mut(), &controls));
@@ -118,6 +126,11 @@ fn main() {
         if let Err(err) = emulator.run_frame() {
             eprintln!("{err}");
             process::exit(1);
+        }
+
+        let samples = emulator.take_audio_samples();
+        if let Some(audio) = audio.as_mut() {
+            audio.queue(&samples);
         }
 
         let serial_output = emulator.take_serial_output();
@@ -138,9 +151,15 @@ fn main() {
             process::exit(1);
         }
 
-        let elapsed = frame_start.elapsed();
-        if elapsed < FRAME_TIME {
-            thread::sleep(FRAME_TIME - elapsed);
+        // Pace emulation off the audio clock when sound is available, otherwise
+        // fall back to sleeping for the remainder of the frame's wall-clock time.
+        if let Some(audio) = audio.as_ref() {
+            audio.wait_for_drain();
+        } else {
+            let elapsed = frame_start.elapsed();
+            if elapsed < FRAME_TIME {
+                thread::sleep(FRAME_TIME - elapsed);
+            }
         }
     }
 
