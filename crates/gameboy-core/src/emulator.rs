@@ -27,7 +27,7 @@ impl Emulator {
 
     pub fn load_rom(&mut self, bytes: Vec<u8>) -> Result<()> {
         let cartridge = Cartridge::from_bytes(bytes)?;
-        let cgb_mode = cartridge.header().supports_cgb();
+        let cgb_mode = cartridge.header().requires_cgb();
         self.bus.insert_cartridge(cartridge);
         self.bus.set_cgb_mode(cgb_mode);
         self.cpu = if cgb_mode {

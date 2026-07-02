@@ -465,6 +465,10 @@ impl CartridgeHeader {
         matches!(self.cgb_flag, 0x80 | 0xC0)
     }
 
+    pub fn requires_cgb(&self) -> bool {
+        self.cgb_flag == 0xC0
+    }
+
     pub fn rom_size_code(&self) -> u8 {
         self.rom_size_code
     }
@@ -762,6 +766,28 @@ mod tests {
         assert_eq!(cartridge.header().mapper_kind(), MapperKind::NoMbc);
         assert_eq!(cartridge.header().rom_size(), MIN_ROM_SIZE);
         assert_eq!(cartridge.header().ram_size(), 0);
+    }
+
+    #[test]
+    fn cgb_flag_distinguishes_dmg_compatible_from_cgb_only() {
+        let mut dmg_only = synthetic_rom("DMG", &[(0, &[0x00])]);
+        dmg_only[CGB_FLAG_OFFSET] = 0x00;
+        let cart = Cartridge::from_bytes(dmg_only).expect("valid ROM");
+        assert!(!cart.header().supports_cgb());
+        assert!(!cart.header().requires_cgb());
+
+        let mut cgb_compatible = synthetic_rom("COMPAT", &[(0, &[0x00])]);
+        cgb_compatible[CGB_FLAG_OFFSET] = 0x80;
+        let cart = Cartridge::from_bytes(cgb_compatible).expect("valid ROM");
+        assert!(cart.header().supports_cgb());
+        // DMG-compatible games must not force CGB mode on our DMG PPU.
+        assert!(!cart.header().requires_cgb());
+
+        let mut cgb_only = synthetic_rom("CGBONLY", &[(0, &[0x00])]);
+        cgb_only[CGB_FLAG_OFFSET] = 0xC0;
+        let cart = Cartridge::from_bytes(cgb_only).expect("valid ROM");
+        assert!(cart.header().supports_cgb());
+        assert!(cart.header().requires_cgb());
     }
 
     #[test]
