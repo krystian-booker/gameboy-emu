@@ -9,28 +9,17 @@ use cpal::{
 };
 use gameboy_core::apu::{AudioSample, SAMPLE_RATE};
 
-/// Interleaved stereo f32 samples shared between the emulator thread (producer)
-/// and the cpal audio callback (consumer).
 type SharedBuffer = Arc<Mutex<VecDeque<f32>>>;
 
-/// Owns the live audio output stream and the plumbing needed to feed it.
-///
-/// The cpal stream must stay alive for playback to continue, so callers keep
-/// this struct around for the lifetime of the emulator loop.
 pub struct AudioOutput {
     _stream: Stream,
     buffer: SharedBuffer,
     resampler: Resampler,
     channels: usize,
-    /// Target maximum number of interleaved samples to keep buffered. Used to
-    /// throttle emulation to the rate the audio device drains samples.
     max_buffered: usize,
 }
 
 impl AudioOutput {
-    /// Opens the default output device and starts playback. Returns `None`
-    /// (and logs a message) if no device is available or the stream fails to
-    /// build, so the frontend can fall back to running without sound.
     pub fn new() -> Option<Self> {
         let host = cpal::default_host();
         let device = host.default_output_device()?;
@@ -58,7 +47,6 @@ impl AudioOutput {
             return None;
         }
 
-        // Keep roughly 100ms of audio buffered before throttling the emulator.
         let max_buffered = (out_rate as usize / 10) * channels;
 
         Some(Self {
@@ -70,7 +58,6 @@ impl AudioOutput {
         })
     }
 
-    /// Resamples a batch of APU samples to the device rate and queues them.
     pub fn queue(&mut self, samples: &[AudioSample]) {
         if samples.is_empty() {
             return;
@@ -83,7 +70,6 @@ impl AudioOutput {
         if self.channels == 2 {
             buffer.extend(stereo);
         } else {
-            // Fan the stereo pair out to however many channels the device wants.
             for pair in stereo.chunks_exact(2) {
                 for channel in 0..self.channels {
                     buffer.push_back(pair[channel.min(1)]);
@@ -92,16 +78,8 @@ impl AudioOutput {
         }
     }
 
-    /// Blocks until the audio device has drained the queue below the target
-    /// fill level. This paces emulation to real time using the audio clock.
-    pub fn wait_for_drain(&self) {
-        loop {
-            let len = self.buffer.lock().unwrap().len();
-            if len <= self.max_buffered {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
+    pub fn ready_for_more(&self) -> bool {
+        self.buffer.lock().unwrap().len() <= self.max_buffered
     }
 }
 
@@ -131,11 +109,8 @@ where
         .ok()
 }
 
-/// Streaming linear resampler from the APU's fixed rate to the device rate.
 struct Resampler {
-    /// Input samples consumed per output sample (`in_rate / out_rate`).
     step: f64,
-    /// Fractional position between the previous and current input sample.
     frac: f64,
     prev_left: f32,
     prev_right: f32,
@@ -153,7 +128,6 @@ impl Resampler {
         }
     }
 
-    /// Appends resampled interleaved stereo f32 samples to `out`.
     fn process(&mut self, input: &[AudioSample], out: &mut Vec<f32>) {
         for sample in input {
             let cur_left = sample.left as f32 / 32768.0;

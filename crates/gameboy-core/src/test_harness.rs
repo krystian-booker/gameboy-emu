@@ -149,10 +149,10 @@ mod tests {
         let mut program = Vec::new();
         for byte in message.bytes() {
             program.extend_from_slice(&[
-                0x3E, byte, // LD A,d8
-                0xE0, 0x01, // LDH (SB),A
-                0x3E, 0x81, // LD A,$81
-                0xE0, 0x02, // LDH (SC),A
+                0x3E, byte,
+                0xE0, 0x01,
+                0x3E, 0x81,
+                0xE0, 0x02,
             ]);
         }
         program.push(0x76);

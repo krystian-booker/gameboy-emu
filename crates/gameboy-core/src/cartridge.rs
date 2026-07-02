@@ -780,7 +780,6 @@ mod tests {
         cgb_compatible[CGB_FLAG_OFFSET] = 0x80;
         let cart = Cartridge::from_bytes(cgb_compatible).expect("valid ROM");
         assert!(cart.header().supports_cgb());
-        // DMG-compatible games must not force CGB mode on our DMG PPU.
         assert!(!cart.header().requires_cgb());
 
         let mut cgb_only = synthetic_rom("CGBONLY", &[(0, &[0x00])]);

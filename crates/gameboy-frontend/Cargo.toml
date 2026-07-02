@@ -5,7 +5,9 @@ edition = "2021"
 license = "MIT"
 
 [dependencies]
+gameboy-core = { path = "../gameboy-core" }
+eframe = { version = "0.35", default-features = false, features = ["glow", "persistence"] }
+egui = "0.35"
+serde = { version = "1", features = ["derive"] }
 cpal = "0.15"
 gilrs = "0.11"
-gameboy-core = { path = "../gameboy-core" }
-minifb = "0.27"
