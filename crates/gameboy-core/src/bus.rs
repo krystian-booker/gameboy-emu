@@ -1093,7 +1093,8 @@ mod tests {
         let mut bus = Bus::default();
         bus.set_cgb_mode(true);
         for i in 0..0x10u16 {
-            bus.write_byte(0xC000 + i, (i + 1) as u8).expect("seed wram");
+            bus.write_byte(0xC000 + i, (i + 1) as u8)
+                .expect("seed wram");
         }
 
         bus.write_byte(0xFF51, 0xC0).expect("src high");
@@ -1113,7 +1114,8 @@ mod tests {
         let mut bus = Bus::default();
         bus.set_cgb_mode(true);
         for i in 0..0x20u16 {
-            bus.write_byte(0xC000 + i, (i + 1) as u8).expect("seed wram");
+            bus.write_byte(0xC000 + i, (i + 1) as u8)
+                .expect("seed wram");
         }
 
         bus.write_byte(0xFF51, 0xC0).expect("src high");

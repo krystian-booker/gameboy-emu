@@ -17,7 +17,9 @@ use gilrs::{ev::Code, Button, EventType, Gilrs};
 use crate::{
     browser::DirBrowser,
     config::Config,
-    input::{bind_pressed, mappings, menu_pressed, read_joypad_state, Bind, ControlBinding, InputBinding},
+    input::{
+        bind_pressed, mappings, menu_pressed, read_joypad_state, Bind, ControlBinding, InputBinding,
+    },
     library::{spawn_scan, RomEntry, ScanResult},
     renderer::{Pipeline, ShaderParams},
     session::Session,
@@ -110,13 +112,7 @@ fn settings_items() -> Vec<SetItem> {
     items
 }
 
-fn focus_move(
-    cur: SetItem,
-    up: bool,
-    down: bool,
-    left: bool,
-    right: bool,
-) -> Option<SetItem> {
+fn focus_move(cur: SetItem, up: bool, down: bool, left: bool, right: bool) -> Option<SetItem> {
     use SetItem::*;
     let last_btn = SETTINGS_BUTTONS.len() - 1;
     match cur {
@@ -171,7 +167,11 @@ fn focus_move(
         }
         Shader(k) => {
             if down {
-                Some(if k + 1 < SHADER_CONTROLS { Shader(k + 1) } else { ChangeFolder })
+                Some(if k + 1 < SHADER_CONTROLS {
+                    Shader(k + 1)
+                } else {
+                    ChangeFolder
+                })
             } else if up {
                 Some(if k > 0 { Shader(k - 1) } else { Palette })
             } else {
@@ -604,9 +604,7 @@ impl App {
                     self.screen = Screen::Library;
                     return;
                 }
-                Screen::Browser
-                    if self.config.rom_dir.as_ref().is_some_and(|d| d.is_dir()) =>
-                {
+                Screen::Browser if self.config.rom_dir.as_ref().is_some_and(|d| d.is_dir()) => {
                     self.screen = self.browser_from;
                     return;
                 }
@@ -654,7 +652,9 @@ impl App {
                                 }
                             }
                             LibRow::Orphan(si) => {
-                                if let Some(meta) = self.states.auto_entries().get(si).map(|m| (*m).clone()) {
+                                if let Some(meta) =
+                                    self.states.auto_entries().get(si).map(|m| (*m).clone())
+                                {
                                     self.resume_state(meta);
                                 }
                             }
@@ -719,7 +719,10 @@ impl App {
             }
             SetItem::Palette => {
                 let all = PaletteKind::ALL;
-                let cur = all.iter().position(|p| *p == self.config.palette).unwrap_or(0);
+                let cur = all
+                    .iter()
+                    .position(|p| *p == self.config.palette)
+                    .unwrap_or(0);
                 if right || select {
                     self.config.palette = all[(cur + 1) % all.len()];
                 } else if left {
@@ -799,7 +802,11 @@ impl App {
             .show_separator_line(false)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("Cheddy GB").font(theme::silk(12.0)).color(pal.scr));
+                    ui.label(
+                        RichText::new("Cheddy GB")
+                            .font(theme::silk(12.0))
+                            .color(pal.scr),
+                    );
                     ui.add_space(4.0);
                     ui.label(
                         RichText::new("DOT MATRIX WITH STEREO SOUND")
@@ -807,8 +814,7 @@ impl App {
                             .color(pal.scr3),
                     );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let gear_focused =
-                            self.screen == Screen::Library && self.lib_gear_focus;
+                        let gear_focused = self.screen == Screen::Library && self.lib_gear_focus;
                         let gear_color = if self.screen == Screen::Settings || gear_focused {
                             pal.acc
                         } else {
@@ -967,7 +973,14 @@ impl App {
                             }
                         };
                         let thumb = meta.and_then(|m| thumb_texture(state_textures, &ctx, m));
-                        let a = game_row(ui, pal, entry, meta.map(|m| (m, thumb)), selected, lib_scroll);
+                        let a = game_row(
+                            ui,
+                            pal,
+                            entry,
+                            meta.map(|m| (m, thumb)),
+                            selected,
+                            lib_scroll,
+                        );
 
                         if a.discard {
                             if let Some(m) = meta {
@@ -1115,7 +1128,11 @@ impl App {
         let devices: Vec<String> = self
             .gilrs
             .as_ref()
-            .map(|g| g.gamepads().map(|(_, gp)| gp.name().to_uppercase()).collect())
+            .map(|g| {
+                g.gamepads()
+                    .map(|(_, gp)| gp.name().to_uppercase())
+                    .collect()
+            })
             .unwrap_or_default();
         let has_pad = !devices.is_empty();
         if has_pad {
@@ -1171,11 +1188,7 @@ impl App {
                     pal.scr,
                 );
                 let dot_color = if has_pad { pal.scr } else { pal.scr3 };
-                painter.circle_filled(
-                    pos2(galley.right() + 12.0, rect.center().y),
-                    3.5,
-                    dot_color,
-                );
+                painter.circle_filled(pos2(galley.right() + 12.0, rect.center().y), 3.5, dot_color);
 
                 if prev.clicked() && has_pad {
                     self.device_idx = (self.device_idx + devices.len() - 1) % devices.len();
@@ -1209,7 +1222,9 @@ impl App {
 
                         for m in &rows {
                             ui.label(
-                                RichText::new(m.button).font(theme::mono(12.5)).color(pal.scr),
+                                RichText::new(m.button)
+                                    .font(theme::mono(12.5))
+                                    .color(pal.scr),
                             );
 
                             let key_on = listening == Listening::Key(m.id);
@@ -1268,23 +1283,58 @@ impl App {
                 let f = |i: usize| focused == SetItem::Shader(i);
 
                 shader_group(ui, pal, "COLOR & GAMMA");
-                toggle_row(ui, pal, "COLOR CORRECTION", &mut sh.color_correct, f(0), scroll);
+                toggle_row(
+                    ui,
+                    pal,
+                    "COLOR CORRECTION",
+                    &mut sh.color_correct,
+                    f(0),
+                    scroll,
+                );
                 slider_row(ui, pal, "GAMMA WEIGHT", &mut sh.gamma_weight, f(1), scroll);
 
                 shader_group(ui, pal, "GHOSTING");
                 toggle_row(ui, pal, "LCD GHOSTING", &mut sh.ghosting, f(2), scroll);
-                slider_row(ui, pal, "RESPONSE TIME", &mut sh.response_time, f(3), scroll);
+                slider_row(
+                    ui,
+                    pal,
+                    "RESPONSE TIME",
+                    &mut sh.response_time,
+                    f(3),
+                    scroll,
+                );
 
                 shader_group(ui, pal, "SCALING");
                 let integer_on = sh.integer_scale;
                 toggle_row_enabled(
-                    ui, pal, "PIXEL AA", &mut sh.pixel_aa, f(4), scroll, !integer_on, "N/A",
+                    ui,
+                    pal,
+                    "PIXEL AA",
+                    &mut sh.pixel_aa,
+                    f(4),
+                    scroll,
+                    !integer_on,
+                    "N/A",
                 );
-                toggle_row(ui, pal, "INTEGER SCALE", &mut sh.integer_scale, f(5), scroll);
+                toggle_row(
+                    ui,
+                    pal,
+                    "INTEGER SCALE",
+                    &mut sh.integer_scale,
+                    f(5),
+                    scroll,
+                );
 
                 shader_group(ui, pal, "LCD GRID");
                 toggle_row(ui, pal, "LCD GRID", &mut sh.lcd_grid, f(6), scroll);
-                slider_row(ui, pal, "GRID INTENSITY", &mut sh.grid_intensity, f(7), scroll);
+                slider_row(
+                    ui,
+                    pal,
+                    "GRID INTENSITY",
+                    &mut sh.grid_intensity,
+                    f(7),
+                    scroll,
+                );
             });
     }
 
@@ -1320,7 +1370,8 @@ impl App {
             return;
         }
 
-        let pause_now = ctx.input(|i| bind_pressed(i, self.gilrs.as_ref(), &self.controls, Bind::Pause));
+        let pause_now =
+            ctx.input(|i| bind_pressed(i, self.gilrs.as_ref(), &self.controls, Bind::Pause));
         if pause_now && !self.pause_prev {
             self.paused = !self.paused;
             if self.paused {
@@ -1584,7 +1635,8 @@ impl App {
         let center = rect.center();
 
         let panel = Rect::from_center_size(center, vec2(384.0, 372.0));
-        ui.painter().rect_filled(panel, CornerRadius::same(8), pal.bg);
+        ui.painter()
+            .rect_filled(panel, CornerRadius::same(8), pal.bg);
         ui.painter().rect_stroke(
             panel,
             CornerRadius::same(8),
@@ -1615,7 +1667,10 @@ impl App {
             let col = (slot % 2) as f32;
             let row = (slot / 2) as f32;
             let cell_rect = Rect::from_min_size(
-                pos2(origin.x + col * (cell.x + gap), origin.y + row * (cell.y + gap)),
+                pos2(
+                    origin.x + col * (cell.x + gap),
+                    origin.y + row * (cell.y + gap),
+                ),
                 cell,
             );
             let selected = slot == sel_slot;
@@ -1633,10 +1688,8 @@ impl App {
             };
             painter.rect_filled(cell_rect, CornerRadius::same(5), cell_bg);
 
-            let thumb_rect = Rect::from_min_size(
-                cell_rect.min + vec2(8.0, 8.0),
-                vec2(cell.x - 16.0, 78.0),
-            );
+            let thumb_rect =
+                Rect::from_min_size(cell_rect.min + vec2(8.0, 8.0), vec2(cell.x - 16.0, 78.0));
             if let Some(id) = tex_id {
                 egui::Image::new(SizedTexture::new(id, thumb_rect.size())).paint_at(ui, thumb_rect);
             } else {
@@ -1827,10 +1880,16 @@ fn text_button(
     fill: Color32,
     text_color: Color32,
 ) -> egui::Response {
-    let galley = ui.painter().layout_no_wrap(label.to_string(), font, text_color);
+    let galley = ui
+        .painter()
+        .layout_no_wrap(label.to_string(), font, text_color);
     let pad = vec2(13.0, 9.0);
     let (rect, resp) = ui.allocate_at_least(galley.size() + pad * 2.0, Sense::click());
-    let bg = if resp.hovered() { lighten(fill, 0.12) } else { fill };
+    let bg = if resp.hovered() {
+        lighten(fill, 0.12)
+    } else {
+        fill
+    };
     ui.painter().rect_filled(rect, CornerRadius::same(3), bg);
     ui.painter()
         .galley(rect.center() - galley.size() / 2.0, galley, text_color);
@@ -1867,8 +1926,10 @@ fn thumb_texture<'a>(
         return None;
     }
     Some(cache.entry(meta.slug().to_string()).or_insert_with(|| {
-        let image =
-            egui::ColorImage::from_rgba_unmultiplied([SCREEN_WIDTH, SCREEN_HEIGHT], &meta.thumbnail);
+        let image = egui::ColorImage::from_rgba_unmultiplied(
+            [SCREEN_WIDTH, SCREEN_HEIGHT],
+            &meta.thumbnail,
+        );
         ctx.load_texture(
             format!("thumb_{}", meta.slug()),
             image,
@@ -1921,12 +1982,15 @@ fn game_row(
 
     let title_x = if let Some((_, thumb)) = suspend {
         let (tw, th) = (52.0, height - 14.0);
-        let trect =
-            Rect::from_min_size(pos2(rect.left() + pad, rect.center().y - th / 2.0), vec2(tw, th));
+        let trect = Rect::from_min_size(
+            pos2(rect.left() + pad, rect.center().y - th / 2.0),
+            vec2(tw, th),
+        );
         if let Some(tex) = thumb {
             egui::Image::new(SizedTexture::new(tex.id(), vec2(tw, th))).paint_at(ui, trect);
         } else {
-            ui.painter().rect_filled(trect, CornerRadius::same(2), pal.scr);
+            ui.painter()
+                .rect_filled(trect, CornerRadius::same(2), pal.scr);
         }
         trect.right() + 12.0
     } else {
@@ -1986,8 +2050,13 @@ fn game_row(
         } else {
             sub
         };
-        ui.painter()
-            .text(x_center, Align2::CENTER_CENTER, "\u{2715}", theme::mono(19.0), x_col);
+        ui.painter().text(
+            x_center,
+            Align2::CENTER_CENTER,
+            "\u{2715}",
+            theme::mono(19.0),
+            x_col,
+        );
     }
 
     let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
@@ -2073,7 +2142,11 @@ fn toggle_row_enabled(
     enabled: bool,
     off_text: &str,
 ) {
-    let sense = if enabled { Sense::click() } else { Sense::hover() };
+    let sense = if enabled {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
     let (rect, resp) = ui.allocate_at_least(vec2(ui.available_width(), 34.0), sense);
     if enabled && resp.clicked() {
         *value = !*value;
@@ -2166,7 +2239,11 @@ fn slider_row(
     painter.rect_filled(track, CornerRadius::same(3), pal.tint(30));
     let fill = Rect::from_min_size(track.min, vec2(track.width() * t, track.height()));
     painter.rect_filled(fill, CornerRadius::same(3), pal.acc);
-    painter.circle_filled(pos2(track.left() + track.width() * t, track.center().y), 5.0, pal.scr);
+    painter.circle_filled(
+        pos2(track.left() + track.width() * t, track.center().y),
+        5.0,
+        pal.scr,
+    );
     painter.text(
         pos2(rect.right() - 4.0, rect.center().y),
         Align2::RIGHT_CENTER,

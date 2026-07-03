@@ -130,10 +130,7 @@ impl Pass {
     fn new(gl: &glow::Context, header: &str, frag: &str) -> Result<Self, String> {
         unsafe {
             let program = gl.create_program()?;
-            let shaders = [
-                (glow::VERTEX_SHADER, VERT),
-                (glow::FRAGMENT_SHADER, frag),
-            ];
+            let shaders = [(glow::VERTEX_SHADER, VERT), (glow::FRAGMENT_SHADER, frag)];
             let mut compiled = Vec::new();
             for (kind, src) in shaders {
                 let shader = gl.create_shader(kind)?;
@@ -148,7 +145,10 @@ impl Pass {
             }
             gl.link_program(program);
             if !gl.get_program_link_status(program) {
-                return Err(format!("program link failed: {}", gl.get_program_info_log(program)));
+                return Err(format!(
+                    "program link failed: {}",
+                    gl.get_program_info_log(program)
+                ));
             }
             for shader in compiled {
                 gl.detach_shader(program, shader);
@@ -182,7 +182,6 @@ impl Pass {
             gl.uniform_2_f32(loc.as_ref(), x, y);
         }
     }
-
 }
 
 pub struct Pipeline {
@@ -320,7 +319,8 @@ impl Pipeline {
                 bind_tex(gl, 0, self.out_tex);
                 self.grid.set_i32(gl, "u_tex", 0);
                 self.grid.set_f32(gl, "u_intensity", p.grid_intensity);
-                self.grid.set_f32(gl, "u_scale", out_h as f32 / NATIVE_H as f32);
+                self.grid
+                    .set_f32(gl, "u_scale", out_h as f32 / NATIVE_H as f32);
                 self.grid.set_i32(gl, "u_flip", 1);
                 draw(gl);
             } else {
@@ -357,7 +357,8 @@ impl Pipeline {
         self.pixel_aa.bind(gl);
         bind_tex(gl, 0, src);
         self.pixel_aa.set_i32(gl, "u_tex", 0);
-        self.pixel_aa.set_vec2(gl, "u_native", NATIVE_W as f32, NATIVE_H as f32);
+        self.pixel_aa
+            .set_vec2(gl, "u_native", NATIVE_W as f32, NATIVE_H as f32);
         self.pixel_aa.set_vec2(gl, "u_output", out_w, out_h);
         self.pixel_aa.set_i32(gl, "u_aa", aa as i32);
         self.pixel_aa.set_i32(gl, "u_flip", flip as i32);
@@ -406,10 +407,26 @@ unsafe fn new_texture(gl: &glow::Context, w: i32, h: i32) -> glow::Texture {
         glow::UNSIGNED_BYTE,
         glow::PixelUnpackData::Slice(None),
     );
-    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
-    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
-    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
-    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
+    gl.tex_parameter_i32(
+        glow::TEXTURE_2D,
+        glow::TEXTURE_MIN_FILTER,
+        glow::LINEAR as i32,
+    );
+    gl.tex_parameter_i32(
+        glow::TEXTURE_2D,
+        glow::TEXTURE_MAG_FILTER,
+        glow::LINEAR as i32,
+    );
+    gl.tex_parameter_i32(
+        glow::TEXTURE_2D,
+        glow::TEXTURE_WRAP_S,
+        glow::CLAMP_TO_EDGE as i32,
+    );
+    gl.tex_parameter_i32(
+        glow::TEXTURE_2D,
+        glow::TEXTURE_WRAP_T,
+        glow::CLAMP_TO_EDGE as i32,
+    );
     tex
 }
 

@@ -22,7 +22,9 @@ impl Session {
             .map_err(|err| format!("failed to read {}: {err}", rom_path.display()))?;
 
         let mut emulator = Emulator::new();
-        emulator.load_rom(rom.clone()).map_err(|err| err.to_string())?;
+        emulator
+            .load_rom(rom.clone())
+            .map_err(|err| err.to_string())?;
 
         let save_path = rom_path.with_extension("sav");
         let rtc_path = rom_path.with_extension("rtc");
@@ -118,7 +120,10 @@ impl Session {
     }
 
     pub fn ready_for_more(&self) -> bool {
-        self.audio.as_ref().map(|a| a.ready_for_more()).unwrap_or(true)
+        self.audio
+            .as_ref()
+            .map(|a| a.ready_for_more())
+            .unwrap_or(true)
     }
 
     pub fn run_frame(&mut self) -> Result<(), String> {

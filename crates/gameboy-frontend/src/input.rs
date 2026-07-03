@@ -10,7 +10,10 @@ pub enum InputBinding {
     Keyboard(Key),
     GamepadButton(Button),
     GamepadCode(Code),
-    GamepadAxis { axis: Axis, direction: AxisDirection },
+    GamepadAxis {
+        axis: Axis,
+        direction: AxisDirection,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -289,7 +292,11 @@ pub fn bind_pressed(
         })
 }
 
-pub fn menu_pressed(input: &InputState, gilrs: Option<&Gilrs>, controls: &[ControlBinding]) -> bool {
+pub fn menu_pressed(
+    input: &InputState,
+    gilrs: Option<&Gilrs>,
+    controls: &[ControlBinding],
+) -> bool {
     bind_pressed(input, gilrs, controls, Bind::Menu)
 }
 

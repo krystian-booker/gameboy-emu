@@ -90,9 +90,10 @@ impl StateStore {
             if path.extension().and_then(|e| e.to_str()) != Some(META_EXT) {
                 continue;
             }
-            match fs::read(&path).ok().and_then(|bytes| {
-                bincode::deserialize::<StateMeta>(&bytes).ok()
-            }) {
+            match fs::read(&path)
+                .ok()
+                .and_then(|bytes| bincode::deserialize::<StateMeta>(&bytes).ok())
+            {
                 Some(mut meta) if meta.version == FORMAT_VERSION => {
                     meta.slug = path
                         .file_stem()
@@ -119,7 +120,10 @@ impl StateStore {
     }
 
     pub fn auto_entries(&self) -> Vec<&StateMeta> {
-        self.entries.iter().filter(|m| m.slot == AUTO_SLOT).collect()
+        self.entries
+            .iter()
+            .filter(|m| m.slot == AUTO_SLOT)
+            .collect()
     }
 
     pub fn find(&self, rom_path: &Path) -> Option<&StateMeta> {

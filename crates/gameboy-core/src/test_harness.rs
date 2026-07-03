@@ -152,12 +152,7 @@ mod tests {
     fn serial_program(message: &str) -> Vec<u8> {
         let mut program = Vec::new();
         for byte in message.bytes() {
-            program.extend_from_slice(&[
-                0x3E, byte,
-                0xE0, 0x01,
-                0x3E, 0x81,
-                0xE0, 0x02,
-            ]);
+            program.extend_from_slice(&[0x3E, byte, 0xE0, 0x01, 0x3E, 0x81, 0xE0, 0x02]);
         }
         program.push(0x76);
 
@@ -169,9 +164,14 @@ mod tests {
 
     #[test]
     fn detects_pass_from_serial_output() {
-        let run =
-            run_blargg_test_rom_bytes(serial_program("Passed\n"), TestRomConfig { max_frames: 1, model: HardwareModel::Auto })
-                .expect("run test ROM");
+        let run = run_blargg_test_rom_bytes(
+            serial_program("Passed\n"),
+            TestRomConfig {
+                max_frames: 1,
+                model: HardwareModel::Auto,
+            },
+        )
+        .expect("run test ROM");
 
         assert_eq!(run.status, TestRomStatus::Passed);
         assert_eq!(run.serial_text(), "Passed\n");
@@ -181,7 +181,10 @@ mod tests {
     fn detects_failure_from_serial_output() {
         let run = run_blargg_test_rom_bytes(
             serial_program("Failed #1\n"),
-            TestRomConfig { max_frames: 1, model: HardwareModel::Auto },
+            TestRomConfig {
+                max_frames: 1,
+                model: HardwareModel::Auto,
+            },
         )
         .expect("run test ROM");
 
@@ -191,9 +194,14 @@ mod tests {
 
     #[test]
     fn reports_timeout_when_no_result_is_emitted() {
-        let run =
-            run_blargg_test_rom_bytes(serial_program("Running\n"), TestRomConfig { max_frames: 1, model: HardwareModel::Auto })
-                .expect("run test ROM");
+        let run = run_blargg_test_rom_bytes(
+            serial_program("Running\n"),
+            TestRomConfig {
+                max_frames: 1,
+                model: HardwareModel::Auto,
+            },
+        )
+        .expect("run test ROM");
 
         assert_eq!(run.status, TestRomStatus::TimedOut);
         assert_eq!(run.frames, 1);
