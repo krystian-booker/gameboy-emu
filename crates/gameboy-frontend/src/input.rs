@@ -23,6 +23,7 @@ pub enum AxisDirection {
 pub enum Bind {
     Pad(JoypadButton),
     Menu,
+    Pause,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -116,6 +117,13 @@ pub fn default_controls() -> Vec<ControlBinding> {
                 InputBinding::GamepadButton(Button::Mode),
             ],
         },
+        ControlBinding {
+            button: Bind::Pause,
+            inputs: vec![
+                InputBinding::Keyboard(Key::Tab),
+                InputBinding::GamepadButton(Button::North),
+            ],
+        },
     ]
 }
 
@@ -127,7 +135,7 @@ pub struct Mapping {
 }
 
 pub fn mappings(controls: &[ControlBinding]) -> Vec<Mapping> {
-    const ORDER: [(Bind, &str); 9] = [
+    const ORDER: [(Bind, &str); 10] = [
         (Bind::Pad(JoypadButton::Up), "D-Pad Up"),
         (Bind::Pad(JoypadButton::Down), "D-Pad Down"),
         (Bind::Pad(JoypadButton::Left), "D-Pad Left"),
@@ -137,6 +145,7 @@ pub fn mappings(controls: &[ControlBinding]) -> Vec<Mapping> {
         (Bind::Pad(JoypadButton::Start), "Start"),
         (Bind::Pad(JoypadButton::Select), "Select"),
         (Bind::Menu, "Menu"),
+        (Bind::Pause, "Pause"),
     ];
 
     ORDER
@@ -244,15 +253,24 @@ pub fn read_joypad_state(
     state
 }
 
-pub fn menu_pressed(input: &InputState, gilrs: Option<&Gilrs>, controls: &[ControlBinding]) -> bool {
+pub fn bind_pressed(
+    input: &InputState,
+    gilrs: Option<&Gilrs>,
+    controls: &[ControlBinding],
+    target: Bind,
+) -> bool {
     controls
         .iter()
-        .find(|c| c.button == Bind::Menu)
+        .find(|c| c.button == target)
         .is_some_and(|c| {
             c.inputs
                 .iter()
                 .any(|binding| binding_pressed(*binding, input, gilrs))
         })
+}
+
+pub fn menu_pressed(input: &InputState, gilrs: Option<&Gilrs>, controls: &[ControlBinding]) -> bool {
+    bind_pressed(input, gilrs, controls, Bind::Menu)
 }
 
 fn binding_pressed(binding: InputBinding, input: &InputState, gilrs: Option<&Gilrs>) -> bool {

@@ -17,7 +17,7 @@ use gilrs::{ev::Code, Button, EventType, Gilrs};
 use crate::{
     browser::DirBrowser,
     config::Config,
-    input::{mappings, menu_pressed, read_joypad_state, Bind, ControlBinding, InputBinding},
+    input::{bind_pressed, mappings, menu_pressed, read_joypad_state, Bind, ControlBinding, InputBinding},
     library::{spawn_scan, RomEntry, ScanResult},
     renderer::{Pipeline, ShaderParams},
     session::Session,
@@ -27,7 +27,7 @@ use crate::{
 
 const SHADER_CONTROLS: usize = 8;
 
-const SETTINGS_BUTTONS: [Bind; 9] = [
+const SETTINGS_BUTTONS: [Bind; 10] = [
     Bind::Pad(JoypadButton::Up),
     Bind::Pad(JoypadButton::Down),
     Bind::Pad(JoypadButton::Left),
@@ -37,6 +37,7 @@ const SETTINGS_BUTTONS: [Bind; 9] = [
     Bind::Pad(JoypadButton::Start),
     Bind::Pad(JoypadButton::Select),
     Bind::Menu,
+    Bind::Pause,
 ];
 
 const FRAME_TIME: Duration = Duration::from_nanos(16_742_706);
@@ -202,6 +203,8 @@ pub struct App {
     play_accumulated: Duration,
     play_since: Option<Instant>,
     prev_pad: JoypadState,
+    paused: bool,
+    pause_prev: bool,
     listening: Listening,
     lib_gear_focus: bool,
     browser_from: Screen,
@@ -214,7 +217,12 @@ impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         theme::apply(&cc.egui_ctx);
 
-        let config = Config::load(cc.storage);
+        let mut config = Config::load(cc.storage);
+        for default in crate::input::default_controls() {
+            if !config.controls.iter().any(|c| c.button == default.button) {
+                config.controls.push(default);
+            }
+        }
         let browser = DirBrowser::new(config.rom_dir.clone());
 
         let mut app = Self {
@@ -235,6 +243,8 @@ impl App {
             play_accumulated: Duration::ZERO,
             play_since: None,
             prev_pad: JoypadState::new(),
+            paused: false,
+            pause_prev: false,
             listening: Listening::None,
             lib_gear_focus: false,
             browser_from: Screen::Library,
@@ -305,6 +315,8 @@ impl App {
         self.current = None;
         self.play_accumulated = Duration::ZERO;
         self.play_since = None;
+        self.paused = false;
+        self.pause_prev = false;
         self.screen = Screen::Library;
     }
 
@@ -1204,21 +1216,29 @@ impl App {
             return;
         }
 
+        let pause_now = ctx.input(|i| bind_pressed(i, self.gilrs.as_ref(), &self.controls, Bind::Pause));
+        if pause_now && !self.pause_prev {
+            self.paused = !self.paused;
+        }
+        self.pause_prev = pause_now;
+
         let mut has_audio = false;
         if let Some(session) = self.session.as_mut() {
             session.set_joypad_state(joypad);
             has_audio = session.has_audio();
 
-            let mut ran = 0;
-            while ran < MAX_FRAMES_PER_TICK && session.ready_for_more() {
-                if let Err(err) = session.run_frame() {
-                    self.error = Some(err);
-                    self.discard_session();
-                    return;
-                }
-                ran += 1;
-                if !has_audio {
-                    break;
+            if !self.paused {
+                let mut ran = 0;
+                while ran < MAX_FRAMES_PER_TICK && session.ready_for_more() {
+                    if let Err(err) = session.run_frame() {
+                        self.error = Some(err);
+                        self.discard_session();
+                        return;
+                    }
+                    ran += 1;
+                    if !has_audio {
+                        break;
+                    }
                 }
             }
         }
@@ -1226,11 +1246,27 @@ impl App {
         self.upload_frame(pal);
         self.draw_screen(ui, pal);
 
-        if has_audio {
+        if self.paused {
+            self.draw_pause_overlay(ui, pal);
+            ctx.request_repaint_after(FRAME_TIME);
+        } else if has_audio {
             ctx.request_repaint_after(Duration::from_millis(1));
         } else {
             ctx.request_repaint_after(FRAME_TIME);
         }
+    }
+
+    fn draw_pause_overlay(&self, ui: &mut egui::Ui, pal: Palette) {
+        let rect = ui.max_rect();
+        let painter = ui.painter();
+        painter.rect_filled(rect, CornerRadius::ZERO, Color32::from_black_alpha(150));
+        painter.text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            "PAUSED",
+            theme::pixel(30.0),
+            pal.scr,
+        );
     }
 
     fn upload_frame(&mut self, pal: Palette) {
