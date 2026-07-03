@@ -83,6 +83,12 @@ impl Session {
         self.audio.is_some()
     }
 
+    pub fn set_speed(&mut self, speed: f32) {
+        if let Some(audio) = self.audio.as_mut() {
+            audio.set_speed(speed);
+        }
+    }
+
     pub fn ready_for_more(&self) -> bool {
         self.audio.as_ref().map(|a| a.ready_for_more()).unwrap_or(true)
     }

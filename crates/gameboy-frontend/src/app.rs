@@ -44,6 +44,9 @@ const FRAME_TIME: Duration = Duration::from_nanos(16_742_706);
 const MAX_FRAMES_PER_TICK: u32 = 8;
 const BOOT_DURATION: Duration = Duration::from_millis(2200);
 
+const SPEEDS: [f32; 5] = [1.0, 1.5, 2.0, 3.0, 5.0];
+const SAVE_SLOTS: usize = 4;
+
 const ERROR_COLOR: Color32 = Color32::from_rgb(224, 96, 96);
 
 #[derive(Clone, Copy, PartialEq)]
@@ -61,6 +64,22 @@ enum Listening {
     Key(Bind),
     Pad(Bind),
 }
+
+#[derive(Clone, Copy, PartialEq)]
+enum PauseView {
+    Menu,
+    Save,
+    Load,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum PauseItem {
+    Speed,
+    Save,
+    Load,
+}
+
+const PAUSE_ITEMS: [PauseItem; 3] = [PauseItem::Speed, PauseItem::Save, PauseItem::Load];
 
 #[derive(Clone, Copy, PartialEq)]
 enum SetItem {
@@ -205,6 +224,12 @@ pub struct App {
     prev_pad: JoypadState,
     paused: bool,
     pause_prev: bool,
+    speed_idx: usize,
+    speed: f32,
+    pause_view: PauseView,
+    pause_sel: usize,
+    pause_slot: usize,
+    pause_slots: [Option<StateMeta>; SAVE_SLOTS],
     listening: Listening,
     lib_gear_focus: bool,
     browser_from: Screen,
@@ -245,6 +270,12 @@ impl App {
             prev_pad: JoypadState::new(),
             paused: false,
             pause_prev: false,
+            speed_idx: 0,
+            speed: SPEEDS[0],
+            pause_view: PauseView::Menu,
+            pause_sel: 0,
+            pause_slot: 0,
+            pause_slots: Default::default(),
             listening: Listening::None,
             lib_gear_focus: false,
             browser_from: Screen::Library,
@@ -321,6 +352,10 @@ impl App {
     }
 
     fn suspend_current(&mut self) {
+        self.write_state(0);
+    }
+
+    fn write_state(&mut self, slot: u32) {
         let Some(session) = self.session.as_ref() else {
             return;
         };
@@ -341,6 +376,7 @@ impl App {
             entry.color,
             self.total_playtime().as_secs(),
             self.rgba.clone(),
+            slot,
         );
         self.state_textures.remove(meta.slug());
         if let Err(err) = self.states.save(meta, &state) {
@@ -348,7 +384,39 @@ impl App {
         }
     }
 
+    fn save_slot(&mut self, slot: u32) {
+        self.write_state(slot);
+        self.refresh_pause_slots();
+    }
+
+    fn load_slot(&mut self, slot: u32) {
+        let Some(entry) = self.current.clone() else {
+            return;
+        };
+        let Some(meta) = self.states.find_slot(&entry.path, slot).cloned() else {
+            return;
+        };
+        let state = match self.states.read_state(&meta) {
+            Ok(state) => state,
+            Err(err) => {
+                self.error = Some(format!("failed to read save state: {err}"));
+                return;
+            }
+        };
+        match Session::restore(&meta.rom_path, &state) {
+            Ok(session) => {
+                self.session = Some(session);
+                self.error = None;
+                self.paused = false;
+            }
+            Err(err) => {
+                self.error = Some(err);
+            }
+        }
+    }
+
     fn resume_state(&mut self, meta: StateMeta) {
+        self.reset_playback();
         self.bank_playtime();
         self.flush_saves();
 
@@ -392,8 +460,17 @@ impl App {
         self.screen = Screen::Library;
     }
 
+    fn reset_playback(&mut self) {
+        self.speed_idx = 0;
+        self.speed = SPEEDS[0];
+        self.paused = false;
+        self.pause_view = PauseView::Menu;
+        self.pause_sel = 0;
+    }
+
     fn launch(&mut self, entry: RomEntry) {
         self.lib_gear_focus = false;
+        self.reset_playback();
         if let Some(meta) = self.states.find(&entry.path).cloned() {
             self.resume_state(meta);
             return;
@@ -514,7 +591,7 @@ impl App {
                     self.open_settings();
                     return;
                 }
-                
+
                 if self.lib_gear_focus {
                     if select {
                         self.open_settings();
@@ -546,7 +623,7 @@ impl App {
                                 }
                             }
                             LibRow::Orphan(si) => {
-                                if let Some(meta) = self.states.entries().get(si).cloned() {
+                                if let Some(meta) = self.states.auto_entries().get(si).map(|m| (*m).clone()) {
                                     self.resume_state(meta);
                                 }
                             }
@@ -679,7 +756,6 @@ impl App {
         }
     }
 
-
     fn titlebar(&mut self, ui: &mut egui::Ui, pal: Palette) {
         let frame = egui::Frame::default()
             .fill(pal.bg2)
@@ -732,7 +808,6 @@ impl App {
         }
     }
 
-
     fn ui_boot(&mut self, ui: &mut egui::Ui, pal: Palette) {
         let elapsed = self
             .boot_started
@@ -782,18 +857,18 @@ impl App {
         }
     }
 
-
     fn library_rows(&self) -> Vec<LibRow> {
         let roms = self.scan.entries();
+        let auto = self.states.auto_entries();
         let mut matched: HashSet<&str> = HashSet::new();
-        let mut rows: Vec<LibRow> = Vec::with_capacity(roms.len() + self.states.entries().len());
+        let mut rows: Vec<LibRow> = Vec::with_capacity(roms.len() + auto.len());
         for (i, entry) in roms.iter().enumerate() {
             if let Some(meta) = self.states.find(&entry.path) {
                 matched.insert(meta.slug());
             }
             rows.push(LibRow::Rom(i));
         }
-        for (i, meta) in self.states.entries().iter().enumerate() {
+        for (i, meta) in auto.iter().enumerate() {
             if !matched.contains(meta.slug()) {
                 rows.push(LibRow::Orphan(i));
             }
@@ -846,6 +921,7 @@ impl App {
                         ..
                     } = &mut *self;
                     let roms = scan.entries();
+                    let auto = states.auto_entries();
 
                     for (i, row) in rows.iter().enumerate() {
                         let selected = i == sel;
@@ -853,7 +929,7 @@ impl App {
                         let (entry, meta): (&RomEntry, Option<&StateMeta>) = match *row {
                             LibRow::Rom(ri) => (&roms[ri], states.find(&roms[ri].path)),
                             LibRow::Orphan(si) => {
-                                let meta = &states.entries()[si];
+                                let meta = auto[si];
                                 owned = entry_from_meta(meta);
                                 (&owned, Some(meta))
                             }
@@ -921,7 +997,6 @@ impl App {
             None => {}
         }
     }
-
 
     fn ui_settings(&mut self, ui: &mut egui::Ui, pal: Palette) {
         self.poll_scan(&ui.ctx().clone());
@@ -1180,7 +1255,6 @@ impl App {
             });
     }
 
-
     fn ui_browser(&mut self, ui: &mut egui::Ui, pal: Palette) {
         let can_cancel = self.config.rom_dir.as_ref().is_some_and(|d| d.is_dir());
 
@@ -1204,11 +1278,8 @@ impl App {
         }
     }
 
-
     fn ui_playing(&mut self, ui: &mut egui::Ui, pal: Palette) {
         let ctx = ui.ctx().clone();
-
-        let joypad = ctx.input(|i| read_joypad_state(i, self.gilrs.as_mut(), &self.controls));
 
         if ctx.input(|i| menu_pressed(i, self.gilrs.as_ref(), &self.controls)) {
             self.pause();
@@ -1219,26 +1290,42 @@ impl App {
         let pause_now = ctx.input(|i| bind_pressed(i, self.gilrs.as_ref(), &self.controls, Bind::Pause));
         if pause_now && !self.pause_prev {
             self.paused = !self.paused;
+            if self.paused {
+                self.enter_pause_menu(&ctx);
+            }
         }
         self.pause_prev = pause_now;
+
+        if self.paused {
+            self.handle_pause_input(&ctx);
+        }
+
+        let joypad = if self.paused {
+            JoypadState::new()
+        } else {
+            ctx.input(|i| read_joypad_state(i, self.gilrs.as_mut(), &self.controls))
+        };
 
         let mut has_audio = false;
         if let Some(session) = self.session.as_mut() {
             session.set_joypad_state(joypad);
+            session.set_speed(self.speed);
             has_audio = session.has_audio();
 
             if !self.paused {
+                let max_frames = if has_audio {
+                    MAX_FRAMES_PER_TICK
+                } else {
+                    (self.speed.round() as u32).max(1)
+                };
                 let mut ran = 0;
-                while ran < MAX_FRAMES_PER_TICK && session.ready_for_more() {
+                while ran < max_frames && session.ready_for_more() {
                     if let Err(err) = session.run_frame() {
                         self.error = Some(err);
                         self.discard_session();
                         return;
                     }
                     ran += 1;
-                    if !has_audio {
-                        break;
-                    }
                 }
             }
         }
@@ -1252,21 +1339,254 @@ impl App {
         } else if has_audio {
             ctx.request_repaint_after(Duration::from_millis(1));
         } else {
-            ctx.request_repaint_after(FRAME_TIME);
+            ctx.request_repaint_after(FRAME_TIME.div_f32(self.speed));
         }
     }
 
-    fn draw_pause_overlay(&self, ui: &mut egui::Ui, pal: Palette) {
+    fn enter_pause_menu(&mut self, ctx: &egui::Context) {
+        self.pause_view = PauseView::Menu;
+        self.pause_sel = 0;
+        self.pause_slot = 0;
+        self.refresh_pause_slots();
+        self.sync_prev_pad(ctx);
+    }
+
+    fn refresh_pause_slots(&mut self) {
+        self.pause_slots = match self.current.as_ref() {
+            Some(entry) => self.states.slots_for(&entry.path),
+            None => Default::default(),
+        };
+    }
+
+    fn handle_pause_input(&mut self, ctx: &egui::Context) {
+        let pad = ctx.input(|i| read_joypad_state(i, self.gilrs.as_mut(), &self.controls));
+        let just = |b: JoypadButton| pad.is_pressed(b) && !self.prev_pad.is_pressed(b);
+        let up = just(JoypadButton::Up);
+        let down = just(JoypadButton::Down);
+        let left = just(JoypadButton::Left);
+        let right = just(JoypadButton::Right);
+        let select = just(JoypadButton::A) || just(JoypadButton::Start);
+        let back = just(JoypadButton::B);
+        self.prev_pad = pad;
+
+        match self.pause_view {
+            PauseView::Menu => {
+                if back {
+                    self.paused = false;
+                    return;
+                }
+                let n = PAUSE_ITEMS.len();
+                if down {
+                    self.pause_sel = (self.pause_sel + 1) % n;
+                } else if up {
+                    self.pause_sel = (self.pause_sel + n - 1) % n;
+                }
+                match PAUSE_ITEMS[self.pause_sel] {
+                    PauseItem::Speed => {
+                        if right {
+                            self.speed_idx = (self.speed_idx + 1).min(SPEEDS.len() - 1);
+                        } else if left {
+                            self.speed_idx = self.speed_idx.saturating_sub(1);
+                        }
+                        self.speed = SPEEDS[self.speed_idx];
+                    }
+                    PauseItem::Save if select => {
+                        self.pause_view = PauseView::Save;
+                        self.pause_slot = 0;
+                        self.refresh_pause_slots();
+                    }
+                    PauseItem::Load if select => {
+                        self.pause_view = PauseView::Load;
+                        self.pause_slot = 0;
+                        self.refresh_pause_slots();
+                    }
+                    _ => {}
+                }
+            }
+            PauseView::Save | PauseView::Load => {
+                if back {
+                    self.pause_view = PauseView::Menu;
+                    return;
+                }
+                if right {
+                    self.pause_slot = (self.pause_slot + 1) % SAVE_SLOTS;
+                } else if left {
+                    self.pause_slot = (self.pause_slot + SAVE_SLOTS - 1) % SAVE_SLOTS;
+                } else if down {
+                    self.pause_slot = (self.pause_slot + 2) % SAVE_SLOTS;
+                } else if up {
+                    self.pause_slot = (self.pause_slot + SAVE_SLOTS - 2) % SAVE_SLOTS;
+                }
+                if select {
+                    let slot = self.pause_slot as u32 + 1;
+                    if matches!(self.pause_view, PauseView::Save) {
+                        self.save_slot(slot);
+                    } else if self.pause_slots[self.pause_slot].is_some() {
+                        self.load_slot(slot);
+                    }
+                }
+            }
+        }
+    }
+
+    fn draw_pause_overlay(&mut self, ui: &mut egui::Ui, pal: Palette) {
         let rect = ui.max_rect();
+        ui.painter()
+            .rect_filled(rect, CornerRadius::ZERO, Color32::from_black_alpha(160));
+        match self.pause_view {
+            PauseView::Menu => self.draw_pause_list(ui, pal, rect),
+            PauseView::Save | PauseView::Load => self.draw_pause_slots(ui, pal, rect),
+        }
+    }
+
+    fn draw_pause_list(&self, ui: &mut egui::Ui, pal: Palette, rect: Rect) {
+        let center = rect.center();
+        let panel = Rect::from_center_size(center, vec2(360.0, 300.0));
         let painter = ui.painter();
-        painter.rect_filled(rect, CornerRadius::ZERO, Color32::from_black_alpha(150));
+        painter.rect_filled(panel, CornerRadius::same(8), pal.bg);
+        painter.rect_stroke(
+            panel,
+            CornerRadius::same(8),
+            Stroke::new(1.5, pal.scr),
+            StrokeKind::Inside,
+        );
+
         painter.text(
-            rect.center(),
+            pos2(center.x, panel.top() + 44.0),
             Align2::CENTER_CENTER,
             "PAUSED",
-            theme::pixel(30.0),
+            theme::pixel(22.0),
             pal.scr,
         );
+
+        let start_y = center.y - 8.0;
+        let row_h = 48.0;
+        for (i, item) in PAUSE_ITEMS.iter().enumerate() {
+            let y = start_y + i as f32 * row_h;
+            let selected = i == self.pause_sel;
+            let label = match item {
+                PauseItem::Speed => {
+                    format!("SPEED   \u{25C4} {} \u{25BA}", speed_label(self.speed))
+                }
+                PauseItem::Save => "SAVE STATE".to_string(),
+                PauseItem::Load => "LOAD STATE".to_string(),
+            };
+            let color = if selected {
+                let hl = Rect::from_center_size(pos2(center.x, y), vec2(304.0, 36.0));
+                painter.rect_filled(hl, CornerRadius::same(5), pal.scr);
+                pal.bg
+            } else {
+                pal.scr
+            };
+            painter.text(
+                pos2(center.x, y),
+                Align2::CENTER_CENTER,
+                label,
+                theme::silk(18.0),
+                color,
+            );
+        }
+    }
+
+    fn draw_pause_slots(&mut self, ui: &mut egui::Ui, pal: Palette, rect: Rect) {
+        let ctx = ui.ctx().clone();
+        let is_save = matches!(self.pause_view, PauseView::Save);
+        let sel_slot = self.pause_slot;
+        let center = rect.center();
+
+        let panel = Rect::from_center_size(center, vec2(384.0, 372.0));
+        ui.painter().rect_filled(panel, CornerRadius::same(8), pal.bg);
+        ui.painter().rect_stroke(
+            panel,
+            CornerRadius::same(8),
+            Stroke::new(1.5, pal.scr),
+            StrokeKind::Inside,
+        );
+
+        ui.painter().text(
+            pos2(center.x, panel.top() + 34.0),
+            Align2::CENTER_CENTER,
+            if is_save { "SAVE STATE" } else { "LOAD STATE" },
+            theme::pixel(18.0),
+            pal.scr,
+        );
+
+        let cell = vec2(150.0, 116.0);
+        let gap = 18.0;
+        let grid_w = cell.x * 2.0 + gap;
+        let origin = pos2(center.x - grid_w / 2.0, panel.top() + 60.0);
+
+        let App {
+            pause_slots,
+            state_textures,
+            ..
+        } = &mut *self;
+
+        for (slot, meta) in pause_slots.iter().enumerate() {
+            let col = (slot % 2) as f32;
+            let row = (slot / 2) as f32;
+            let cell_rect = Rect::from_min_size(
+                pos2(origin.x + col * (cell.x + gap), origin.y + row * (cell.y + gap)),
+                cell,
+            );
+            let selected = slot == sel_slot;
+
+            let meta = meta.as_ref();
+            let tex_id = meta
+                .and_then(|m| thumb_texture(state_textures, &ctx, m))
+                .map(|t| t.id());
+
+            let painter = ui.painter();
+            let cell_bg = if selected {
+                with_alpha(pal.scr, 40)
+            } else {
+                with_alpha(pal.scr, 16)
+            };
+            painter.rect_filled(cell_rect, CornerRadius::same(5), cell_bg);
+
+            let thumb_rect = Rect::from_min_size(
+                cell_rect.min + vec2(8.0, 8.0),
+                vec2(cell.x - 16.0, 78.0),
+            );
+            if let Some(id) = tex_id {
+                egui::Image::new(SizedTexture::new(id, thumb_rect.size())).paint_at(ui, thumb_rect);
+            } else {
+                ui.painter()
+                    .rect_filled(thumb_rect, CornerRadius::same(3), pal.bg2);
+                ui.painter().text(
+                    thumb_rect.center(),
+                    Align2::CENTER_CENTER,
+                    "EMPTY",
+                    theme::silk(12.0),
+                    pal.scr2,
+                );
+            }
+
+            let label = match meta {
+                Some(m) => format!(
+                    "SLOT {}  \u{00B7}  {}",
+                    slot + 1,
+                    format_duration(Duration::from_secs(m.playtime_secs))
+                ),
+                None => format!("SLOT {}", slot + 1),
+            };
+            ui.painter().text(
+                pos2(cell_rect.center().x, cell_rect.bottom() - 12.0),
+                Align2::CENTER_CENTER,
+                label,
+                theme::silk(10.0),
+                pal.scr,
+            );
+
+            if selected {
+                ui.painter().rect_stroke(
+                    cell_rect,
+                    CornerRadius::same(5),
+                    Stroke::new(2.0, pal.scr),
+                    StrokeKind::Inside,
+                );
+            }
+        }
     }
 
     fn upload_frame(&mut self, pal: Palette) {
@@ -1410,7 +1730,6 @@ impl eframe::App for App {
         }
     }
 }
-
 
 fn text_button(
     ui: &mut egui::Ui,
@@ -1837,10 +2156,17 @@ fn paint_dot_grid(ui: &egui::Ui, pal: Palette) {
     }
 }
 
-
 fn format_duration(d: Duration) -> String {
     let s = d.as_secs();
     format!("{:02}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60)
+}
+
+fn speed_label(speed: f32) -> String {
+    if speed.fract() == 0.0 {
+        format!("{}x", speed as u32)
+    } else {
+        format!("{speed}x")
+    }
 }
 
 fn shorten(s: &str, max: usize) -> String {

@@ -27,6 +27,8 @@ pub struct StateMeta {
     pub thumbnail: Vec<u8>,
     #[serde(skip)]
     slug: String,
+    #[serde(skip)]
+    slot: u32,
 }
 
 impl StateMeta {
@@ -38,8 +40,9 @@ impl StateMeta {
         color: bool,
         playtime_secs: u64,
         thumbnail: Vec<u8>,
+        slot: u32,
     ) -> Self {
-        let slug = slug_for(&rom_path, AUTO_SLOT);
+        let slug = slug_for(&rom_path, slot);
         Self {
             version: FORMAT_VERSION,
             rom_path,
@@ -50,6 +53,7 @@ impl StateMeta {
             saved_at_unix: now_unix(),
             thumbnail,
             slug,
+            slot,
         }
     }
 
@@ -94,6 +98,7 @@ impl StateStore {
                         .file_stem()
                         .map(|s| s.to_string_lossy().into_owned())
                         .unwrap_or_default();
+                    meta.slot = slot_from_slug(&meta.slug);
                     self.entries.push(meta);
                 }
                 Some(_) => eprintln!("skipping incompatible save state: {}", path.display()),
@@ -113,9 +118,21 @@ impl StateStore {
         &self.entries
     }
 
+    pub fn auto_entries(&self) -> Vec<&StateMeta> {
+        self.entries.iter().filter(|m| m.slot == AUTO_SLOT).collect()
+    }
+
     pub fn find(&self, rom_path: &Path) -> Option<&StateMeta> {
-        let slug = slug_for(rom_path, AUTO_SLOT);
+        self.find_slot(rom_path, AUTO_SLOT)
+    }
+
+    pub fn find_slot(&self, rom_path: &Path, slot: u32) -> Option<&StateMeta> {
+        let slug = slug_for(rom_path, slot);
         self.entries.iter().find(|m| m.slug == slug)
+    }
+
+    pub fn slots_for(&self, rom_path: &Path) -> [Option<StateMeta>; 4] {
+        std::array::from_fn(|i| self.find_slot(rom_path, i as u32 + 1).cloned())
     }
 
     pub fn save(&mut self, meta: StateMeta, state: &[u8]) -> io::Result<()> {
@@ -152,6 +169,12 @@ impl StateStore {
         self.entries.retain(|m| m.slug != slug);
         Ok(())
     }
+}
+
+fn slot_from_slug(slug: &str) -> u32 {
+    slug.rsplit_once("_s")
+        .and_then(|(_, n)| n.parse().ok())
+        .unwrap_or(AUTO_SLOT)
 }
 
 fn slug_for(rom_path: &Path, slot: u32) -> String {

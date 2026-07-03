@@ -17,6 +17,8 @@ pub struct AudioOutput {
     resampler: Resampler,
     channels: usize,
     max_buffered: usize,
+    speed: f32,
+    drop_frac: f32,
 }
 
 impl AudioOutput {
@@ -55,7 +57,17 @@ impl AudioOutput {
             resampler: Resampler::new(SAMPLE_RATE, out_rate),
             channels,
             max_buffered,
+            speed: 1.0,
+            drop_frac: 0.0,
         })
+    }
+
+    pub fn set_speed(&mut self, speed: f32) {
+        let speed = speed.max(1.0);
+        if speed != self.speed {
+            self.speed = speed;
+            self.drop_frac = 0.0;
+        }
     }
 
     pub fn queue(&mut self, samples: &[AudioSample]) {
@@ -67,10 +79,18 @@ impl AudioOutput {
         self.resampler.process(samples, &mut stereo);
 
         let mut buffer = self.buffer.lock().unwrap();
-        if self.channels == 2 {
-            buffer.extend(stereo);
-        } else {
-            for pair in stereo.chunks_exact(2) {
+        for pair in stereo.chunks_exact(2) {
+            if self.speed > 1.0 {
+                self.drop_frac += 1.0;
+                if self.drop_frac < self.speed {
+                    continue;
+                }
+                self.drop_frac -= self.speed;
+            }
+            if self.channels == 2 {
+                buffer.push_back(pair[0]);
+                buffer.push_back(pair[1]);
+            } else {
                 for channel in 0..self.channels {
                     buffer.push_back(pair[channel.min(1)]);
                 }
