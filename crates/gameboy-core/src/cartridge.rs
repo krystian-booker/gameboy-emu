@@ -14,6 +14,7 @@ const MIN_ROM_SIZE: usize = 2 * ROM_BANK_SIZE;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Cartridge {
+    #[serde(skip)]
     rom: Vec<u8>,
     ram: Vec<u8>,
     header: CartridgeHeader,
@@ -146,6 +147,20 @@ impl Cartridge {
             header,
             mapper,
         })
+    }
+
+    pub fn reload_rom(&mut self, rom: Vec<u8>) -> Result<()> {
+        if rom.len() < self.header.rom_size {
+            return Err(EmulatorError::InvalidRom {
+                reason: format!(
+                    "declared ROM size is {} bytes, got {}",
+                    self.header.rom_size,
+                    rom.len()
+                ),
+            });
+        }
+        self.rom = rom[..self.header.rom_size].to_vec();
+        Ok(())
     }
 
     pub fn header(&self) -> &CartridgeHeader {

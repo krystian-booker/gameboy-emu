@@ -10,7 +10,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 const APP_ID: &str = "CheddyGB";
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
 const AUTO_SLOT: u32 = 0;
 const META_EXT: &str = "meta";
 const STATE_EXT: &str = "state";
@@ -159,6 +159,18 @@ impl StateStore {
             .as_ref()
             .ok_or_else(|| io::Error::other("no save-state directory available"))?;
         fs::read(dir.join(format!("{}.{STATE_EXT}", meta.slug)))
+    }
+
+    pub fn prune_missing_roms(&mut self) {
+        let stale: Vec<String> = self
+            .entries
+            .iter()
+            .filter(|m| !m.rom_path.exists())
+            .map(|m| m.slug().to_string())
+            .collect();
+        for slug in stale {
+            let _ = self.remove(&slug);
+        }
     }
 
     pub fn remove(&mut self, slug: &str) -> io::Result<()> {

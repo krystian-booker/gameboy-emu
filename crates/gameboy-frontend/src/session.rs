@@ -13,6 +13,7 @@ pub struct Session {
     save_path: PathBuf,
     rtc_path: PathBuf,
     audio: Option<AudioOutput>,
+    rom: Vec<u8>,
 }
 
 impl Session {
@@ -21,7 +22,7 @@ impl Session {
             .map_err(|err| format!("failed to read {}: {err}", rom_path.display()))?;
 
         let mut emulator = Emulator::new();
-        emulator.load_rom(rom).map_err(|err| err.to_string())?;
+        emulator.load_rom(rom.clone()).map_err(|err| err.to_string())?;
 
         let save_path = rom_path.with_extension("sav");
         let rtc_path = rom_path.with_extension("rtc");
@@ -51,6 +52,7 @@ impl Session {
             save_path,
             rtc_path,
             audio,
+            rom,
         })
     }
 
@@ -60,8 +62,14 @@ impl Session {
     }
 
     pub fn restore(rom_path: &Path, state: &[u8]) -> Result<Self, String> {
-        let emulator: Emulator = bincode::deserialize(state)
+        let rom = fs::read(rom_path)
+            .map_err(|err| format!("failed to read {}: {err}", rom_path.display()))?;
+
+        let mut emulator: Emulator = bincode::deserialize(state)
             .map_err(|err| format!("failed to load save state: {err}"))?;
+        emulator
+            .reload_rom_bytes(rom.clone())
+            .map_err(|err| err.to_string())?;
 
         let save_path = rom_path.with_extension("sav");
         let rtc_path = rom_path.with_extension("rtc");
@@ -76,7 +84,27 @@ impl Session {
             save_path,
             rtc_path,
             audio,
+            rom,
         })
+    }
+
+    pub fn restore_into(&mut self, state: &[u8]) -> Result<(), String> {
+        let mut emulator: Emulator = bincode::deserialize(state)
+            .map_err(|err| format!("failed to load rewind state: {err}"))?;
+        emulator
+            .reload_rom_bytes(self.rom.clone())
+            .map_err(|err| err.to_string())?;
+        self.emulator = emulator;
+        if let Some(audio) = self.audio.as_mut() {
+            audio.clear();
+        }
+        Ok(())
+    }
+
+    pub fn clear_audio(&mut self) {
+        if let Some(audio) = self.audio.as_mut() {
+            audio.clear();
+        }
     }
 
     pub fn has_audio(&self) -> bool {

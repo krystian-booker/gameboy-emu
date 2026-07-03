@@ -30,10 +30,8 @@ const FRAG_COLOR: &str = r#"
 in vec2 v_uv;
 out vec4 frag;
 uniform sampler2D u_tex;
-uniform float u_gamma;      // gamma_weight, 0..1
+uniform float u_gamma;
 
-// Higan/gambatte GBC reflective-TFT correction matrix (columns are the
-// contribution of each input channel), simulating the muted hardware colors.
 const mat3 GBC = mat3(
     26.0 / 32.0, 0.0,          6.0 / 32.0,
      4.0 / 32.0, 24.0 / 32.0,  4.0 / 32.0,
@@ -42,8 +40,6 @@ const mat3 GBC = mat3(
 
 void main() {
     vec3 c = texture(u_tex, v_uv).rgb;
-    // pow(In, target_gamma / native_gamma): reduce the modern ~2.2 curve toward
-    // the simulated ~3.3 hardware curve to tame neon over-saturation.
     float exponent = mix(1.0, 1.5, clamp(u_gamma, 0.0, 1.0));
     c = pow(c, vec3(exponent));
     c = clamp(GBC * c, 0.0, 1.0);
@@ -54,17 +50,13 @@ void main() {
 const FRAG_TEMPORAL: &str = r#"
 in vec2 v_uv;
 out vec4 frag;
-uniform sampler2D u_tex;    // current frame
-uniform sampler2D u_prev;   // previous blended frame (history)
-uniform float u_response;   // response_time, 0..1
+uniform sampler2D u_tex;
+uniform sampler2D u_prev;
+uniform float u_response;
 
 void main() {
     vec3 cur = texture(u_tex, v_uv).rgb;
     vec3 prev = texture(u_prev, v_uv).rgb;
-    // Blend toward the previous frame to emulate slow liquid-crystal decay.
-    // Higher response_time = slower pixels = more persistence. This is a per
-    // pixel decay, not a spatial blur, so 60Hz strobing settles into a stable
-    // semi-transparency rather than smearing.
     float k = clamp(u_response, 0.0, 0.95);
     frag = vec4(mix(cur, prev, k), 1.0);
 }
@@ -73,11 +65,11 @@ void main() {
 const FRAG_PIXEL_AA: &str = r#"
 in vec2 v_uv;
 out vec4 frag;
-uniform sampler2D u_tex;   // native texture, sampled with LINEAR filtering
-uniform vec2 u_native;     // native size in texels
-uniform vec2 u_output;     // output size in pixels
-uniform int u_aa;          // anti-aliasing on/off
-uniform int u_flip;        // flip Y when drawing to the screen (GL origin)
+uniform sampler2D u_tex;
+uniform vec2 u_native;
+uniform vec2 u_output;
+uniform int u_aa;
+uniform int u_flip;
 
 void main() {
     vec2 src_uv = v_uv;
@@ -85,17 +77,13 @@ void main() {
     vec2 tsize = u_native;
     vec2 texel = src_uv * tsize;
     if (u_aa == 0) {
-        // Nearest-neighbour: sample the exact source pixel center.
         vec2 nearest = (floor(texel) + 0.5) / tsize;
         frag = vec4(texture(u_tex, nearest).rgb, 1.0);
         return;
     }
-    // Sharp-bilinear: keep the interior of every native pixel unfiltered and
-    // only interpolate within a one-output-pixel band at the pixel boundary,
-    // which removes uneven pixel widths at non-integer scale without blurring.
-    vec2 scale = u_output / tsize;             // output pixels per texel
+    vec2 scale = u_output / tsize;
     vec2 tfloor = floor(texel);
-    vec2 s = fract(texel) - 0.5;               // distance from pixel center
+    vec2 s = fract(texel) - 0.5;
     vec2 region = 0.5 - 0.5 / max(scale, vec2(1.0));
     vec2 f = (s - clamp(s, -region, region)) * scale + 0.5;
     vec2 uv = (tfloor + f) / tsize;
@@ -106,28 +94,22 @@ void main() {
 const FRAG_GRID: &str = r#"
 in vec2 v_uv;
 out vec4 frag;
-uniform sampler2D u_tex;    // upscaled image at output resolution
-uniform float u_intensity;  // grid_intensity, 0..1
-uniform float u_scale;      // output pixels per native pixel
-uniform int u_flip;         // flip Y when drawing to the screen (GL origin)
+uniform sampler2D u_tex;
+uniform float u_intensity;
+uniform float u_scale;
+uniform int u_flip;
 
 void main() {
     vec2 uv = v_uv;
     if (u_flip == 1) uv.y = 1.0 - uv.y;
     vec3 c = texture(u_tex, uv).rgb;
 
-    // Vertical RGB sub-pixel columns computed from screen coordinates. Column
-    // width is derived from the current scale so the pattern stays locked to
-    // screen pixels and does not shimmer while scrolling.
     float col_w = max(u_scale / 3.0, 1.0);
     float idx = mod(floor(gl_FragCoord.x / col_w), 3.0);
     vec3 mask = idx < 0.5 ? vec3(1.0, 0.55, 0.55)
               : idx < 1.5 ? vec3(0.55, 1.0, 0.55)
                           : vec3(0.55, 0.55, 1.0);
 
-    // Horizontal cell gap: a dark line at each native pixel boundary, its width
-    // computed from the pixel-space derivative (fwidth) to stay AA'd at any
-    // scale and avoid moiré.
     float cell = max(u_scale, 1.0);
     float y = gl_FragCoord.y / cell;
     float fy = fract(y);

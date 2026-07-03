@@ -24,6 +24,8 @@ pub enum Bind {
     Pad(JoypadButton),
     Menu,
     Pause,
+    Rewind,
+    Turbo,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -124,6 +126,20 @@ pub fn default_controls() -> Vec<ControlBinding> {
                 InputBinding::GamepadButton(Button::North),
             ],
         },
+        ControlBinding {
+            button: Bind::Rewind,
+            inputs: vec![
+                InputBinding::Keyboard(Key::OpenBracket),
+                InputBinding::GamepadButton(Button::LeftTrigger),
+            ],
+        },
+        ControlBinding {
+            button: Bind::Turbo,
+            inputs: vec![
+                InputBinding::Keyboard(Key::CloseBracket),
+                InputBinding::GamepadButton(Button::RightTrigger),
+            ],
+        },
     ]
 }
 
@@ -135,7 +151,7 @@ pub struct Mapping {
 }
 
 pub fn mappings(controls: &[ControlBinding]) -> Vec<Mapping> {
-    const ORDER: [(Bind, &str); 10] = [
+    const ORDER: [(Bind, &str); 12] = [
         (Bind::Pad(JoypadButton::Up), "D-Pad Up"),
         (Bind::Pad(JoypadButton::Down), "D-Pad Down"),
         (Bind::Pad(JoypadButton::Left), "D-Pad Left"),
@@ -146,6 +162,8 @@ pub fn mappings(controls: &[ControlBinding]) -> Vec<Mapping> {
         (Bind::Pad(JoypadButton::Select), "Select"),
         (Bind::Menu, "Menu"),
         (Bind::Pause, "Pause"),
+        (Bind::Rewind, "Rewind"),
+        (Bind::Turbo, "Turbo"),
     ];
 
     ORDER
@@ -211,6 +229,8 @@ fn gamepad_button_label(button: Button) -> String {
         Button::Start => "Start".into(),
         Button::Select => "Select".into(),
         Button::Mode => "Home".into(),
+        Button::LeftTrigger => "LB".into(),
+        Button::RightTrigger => "RB".into(),
         other => format!("{other:?}"),
     }
 }

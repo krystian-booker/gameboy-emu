@@ -27,7 +27,7 @@ use crate::{
 
 const SHADER_CONTROLS: usize = 8;
 
-const SETTINGS_BUTTONS: [Bind; 10] = [
+const SETTINGS_BUTTONS: [Bind; 12] = [
     Bind::Pad(JoypadButton::Up),
     Bind::Pad(JoypadButton::Down),
     Bind::Pad(JoypadButton::Left),
@@ -38,6 +38,8 @@ const SETTINGS_BUTTONS: [Bind; 10] = [
     Bind::Pad(JoypadButton::Select),
     Bind::Menu,
     Bind::Pause,
+    Bind::Rewind,
+    Bind::Turbo,
 ];
 
 const FRAME_TIME: Duration = Duration::from_nanos(16_742_706);
@@ -46,6 +48,11 @@ const BOOT_DURATION: Duration = Duration::from_millis(2200);
 
 const SPEEDS: [f32; 5] = [1.0, 1.5, 2.0, 3.0, 5.0];
 const SAVE_SLOTS: usize = 4;
+
+const TURBO_MULTIPLIER: f32 = 2.0;
+const REWIND_CAPTURE_INTERVAL: u32 = 4;
+const REWIND_MAX_SNAPSHOTS: usize = 450;
+const REWIND_TICKS_PER_STEP: u32 = REWIND_CAPTURE_INTERVAL;
 
 const ERROR_COLOR: Color32 = Color32::from_rgb(224, 96, 96);
 
@@ -226,12 +233,17 @@ pub struct App {
     pause_prev: bool,
     speed_idx: usize,
     speed: f32,
+    rewind_buf: std::collections::VecDeque<Vec<u8>>,
+    frames_since_capture: u32,
+    rewind_tick: u32,
+    rewinding: bool,
     pause_view: PauseView,
     pause_sel: usize,
     pause_slot: usize,
     pause_slots: [Option<StateMeta>; SAVE_SLOTS],
     listening: Listening,
     lib_gear_focus: bool,
+    lib_scroll: bool,
     browser_from: Screen,
     settings_focus: usize,
     settings_scroll: bool,
@@ -250,13 +262,16 @@ impl App {
         }
         let browser = DirBrowser::new(config.rom_dir.clone());
 
+        let mut states = StateStore::load();
+        states.prune_missing_roms();
+
         let mut app = Self {
             screen: Screen::Boot,
             browser,
             scan: ScanState::Idle,
             session: None,
             current: None,
-            states: StateStore::load(),
+            states,
             state_textures: HashMap::new(),
             controls: config.controls.clone(),
             gilrs: Gilrs::new().ok(),
@@ -272,12 +287,17 @@ impl App {
             pause_prev: false,
             speed_idx: 0,
             speed: SPEEDS[0],
+            rewind_buf: std::collections::VecDeque::new(),
+            frames_since_capture: 0,
+            rewind_tick: 0,
+            rewinding: false,
             pause_view: PauseView::Menu,
             pause_sel: 0,
             pause_slot: 0,
             pause_slots: Default::default(),
             listening: Listening::None,
             lib_gear_focus: false,
+            lib_scroll: false,
             browser_from: Screen::Library,
             settings_focus: 0,
             settings_scroll: false,
@@ -408,6 +428,7 @@ impl App {
                 self.session = Some(session);
                 self.error = None;
                 self.paused = false;
+                self.clear_rewind();
             }
             Err(err) => {
                 self.error = Some(err);
@@ -466,6 +487,14 @@ impl App {
         self.paused = false;
         self.pause_view = PauseView::Menu;
         self.pause_sel = 0;
+        self.clear_rewind();
+    }
+
+    fn clear_rewind(&mut self) {
+        self.rewind_buf.clear();
+        self.frames_since_capture = 0;
+        self.rewind_tick = 0;
+        self.rewinding = false;
     }
 
     fn launch(&mut self, entry: RomEntry) {
@@ -612,8 +641,10 @@ impl App {
                     }
                     if down {
                         self.sel = (self.sel + 1) % count;
+                        self.lib_scroll = true;
                     } else if up {
                         self.sel -= 1;
+                        self.lib_scroll = true;
                     }
                     if select {
                         match rows[self.sel] {
@@ -869,7 +900,7 @@ impl App {
             rows.push(LibRow::Rom(i));
         }
         for (i, meta) in auto.iter().enumerate() {
-            if !matched.contains(meta.slug()) {
+            if !matched.contains(meta.slug()) && meta.rom_path.exists() {
                 rows.push(LibRow::Orphan(i));
             }
         }
@@ -892,6 +923,7 @@ impl App {
         } else {
             self.sel
         };
+        let lib_scroll = self.lib_scroll;
         let mut action: Option<LibAction> = None;
 
         egui::ScrollArea::vertical()
@@ -935,7 +967,7 @@ impl App {
                             }
                         };
                         let thumb = meta.and_then(|m| thumb_texture(state_textures, &ctx, m));
-                        let a = game_row(ui, pal, entry, meta.map(|m| (m, thumb)), selected);
+                        let a = game_row(ui, pal, entry, meta.map(|m| (m, thumb)), selected, lib_scroll);
 
                         if a.discard {
                             if let Some(m) = meta {
@@ -979,6 +1011,7 @@ impl App {
                     ui.colored_label(ERROR_COLOR, err);
                 }
             });
+        self.lib_scroll = false;
 
         match action {
             Some(LibAction::Select(i)) => self.sel = i,
@@ -1306,17 +1339,53 @@ impl App {
             ctx.input(|i| read_joypad_state(i, self.gilrs.as_mut(), &self.controls))
         };
 
+        let (turbo_held, rewind_held) = if self.paused {
+            (false, false)
+        } else {
+            ctx.input(|i| {
+                (
+                    bind_pressed(i, self.gilrs.as_ref(), &self.controls, Bind::Turbo),
+                    bind_pressed(i, self.gilrs.as_ref(), &self.controls, Bind::Rewind),
+                )
+            })
+        };
+        let effective_speed = if turbo_held {
+            self.speed * TURBO_MULTIPLIER
+        } else {
+            self.speed
+        };
+
         let mut has_audio = false;
         if let Some(session) = self.session.as_mut() {
             session.set_joypad_state(joypad);
-            session.set_speed(self.speed);
+            session.set_speed(effective_speed);
             has_audio = session.has_audio();
 
-            if !self.paused {
+            if self.paused {
+            } else if rewind_held {
+                if !self.rewinding {
+                    session.clear_audio();
+                    self.rewinding = true;
+                    self.rewind_tick = 0;
+                }
+                self.rewind_tick += 1;
+                if self.rewind_tick >= REWIND_TICKS_PER_STEP {
+                    self.rewind_tick = 0;
+                    if let Some(state) = self.rewind_buf.pop_back() {
+                        if let Err(err) = session.restore_into(&state) {
+                            self.error = Some(err);
+                            self.discard_session();
+                            return;
+                        }
+                    }
+                }
+                self.frames_since_capture = 0;
+            } else {
+                self.rewinding = false;
                 let max_frames = if has_audio {
                     MAX_FRAMES_PER_TICK
                 } else {
-                    (self.speed.round() as u32).max(1)
+                    (effective_speed.round() as u32).max(1)
                 };
                 let mut ran = 0;
                 while ran < max_frames && session.ready_for_more() {
@@ -1327,6 +1396,24 @@ impl App {
                     }
                     ran += 1;
                 }
+
+                self.frames_since_capture += ran;
+                if ran > 0 && self.frames_since_capture >= REWIND_CAPTURE_INTERVAL {
+                    match session.snapshot() {
+                        Ok(snap) => {
+                            self.rewind_buf.push_back(snap);
+                            while self.rewind_buf.len() > REWIND_MAX_SNAPSHOTS {
+                                self.rewind_buf.pop_front();
+                            }
+                        }
+                        Err(err) => {
+                            self.error = Some(err);
+                            self.discard_session();
+                            return;
+                        }
+                    }
+                    self.frames_since_capture = 0;
+                }
             }
         }
 
@@ -1336,10 +1423,12 @@ impl App {
         if self.paused {
             self.draw_pause_overlay(ui, pal);
             ctx.request_repaint_after(FRAME_TIME);
+        } else if rewind_held {
+            ctx.request_repaint_after(FRAME_TIME);
         } else if has_audio {
             ctx.request_repaint_after(Duration::from_millis(1));
         } else {
-            ctx.request_repaint_after(FRAME_TIME.div_f32(self.speed));
+            ctx.request_repaint_after(FRAME_TIME.div_f32(effective_speed));
         }
     }
 
@@ -1794,11 +1883,16 @@ fn game_row(
     entry: &RomEntry,
     suspend: Option<(&StateMeta, Option<&egui::TextureHandle>)>,
     selected: bool,
+    scroll: bool,
 ) -> RowAction {
     let pad = 16.0;
     let height = if suspend.is_some() { 58.0 } else { 46.0 };
     let (rect, resp) = ui.allocate_at_least(vec2(ui.available_width(), height), Sense::click());
     let hovered = resp.hovered();
+
+    if selected && scroll {
+        ui.scroll_to_rect(rect, Some(Align::Center));
+    }
 
     let (bg, fg, sub) = if selected {
         (pal.scr, pal.bg, pal.bg)

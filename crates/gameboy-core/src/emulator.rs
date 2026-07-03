@@ -38,6 +38,14 @@ impl Emulator {
         Ok(())
     }
 
+    pub fn reload_rom_bytes(&mut self, bytes: Vec<u8>) -> Result<()> {
+        if let Some(cartridge) = self.bus.cartridge_mut() {
+            cartridge.reload_rom(bytes)
+        } else {
+            Ok(())
+        }
+    }
+
     pub fn has_battery_save(&self) -> bool {
         self.bus
             .cartridge()
@@ -281,10 +289,9 @@ mod tests {
 
     #[test]
     fn snapshot_round_trip_preserves_full_state() {
+        let rom = synthetic_rom("TEST", &[(0x0100, &[0x00, 0xC3, 0x00, 0x01])]);
         let mut emulator = Emulator::new();
-        emulator
-            .load_rom(synthetic_rom("TEST", &[(0x0100, &[0x00, 0xC3, 0x00, 0x01])]))
-            .expect("load ROM");
+        emulator.load_rom(rom.clone()).expect("load ROM");
 
         for _ in 0..3 {
             emulator.run_frame().expect("run frame");
@@ -292,6 +299,7 @@ mod tests {
 
         let bytes = bincode::serialize(&emulator).expect("serialize");
         let mut restored: Emulator = bincode::deserialize(&bytes).expect("deserialize");
+        restored.reload_rom_bytes(rom).expect("reload ROM");
 
         assert_eq!(emulator, restored, "restored state must equal original");
 

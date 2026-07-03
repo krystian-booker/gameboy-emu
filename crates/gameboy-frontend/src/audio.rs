@@ -101,6 +101,11 @@ impl AudioOutput {
     pub fn ready_for_more(&self) -> bool {
         self.buffer.lock().unwrap().len() <= self.max_buffered
     }
+
+    pub fn clear(&mut self) {
+        self.buffer.lock().unwrap().clear();
+        self.drop_frac = 0.0;
+    }
 }
 
 fn build_stream<T>(
