@@ -12,12 +12,12 @@ use egui::{
 };
 use gameboy_core::ppu::{SCREEN_HEIGHT, SCREEN_WIDTH};
 use gameboy_core::{JoypadButton, JoypadState};
-use gilrs::{Button, EventType, Gilrs};
+use gilrs::{ev::Code, Button, EventType, Gilrs};
 
 use crate::{
     browser::DirBrowser,
     config::Config,
-    input::{default_controls, mappings, read_joypad_state, ControlBinding, InputBinding},
+    input::{mappings, menu_pressed, read_joypad_state, Bind, ControlBinding, InputBinding},
     library::{spawn_scan, RomEntry, ScanResult},
     renderer::{Pipeline, ShaderParams},
     session::Session,
@@ -27,15 +27,16 @@ use crate::{
 
 const SHADER_CONTROLS: usize = 8;
 
-const SETTINGS_BUTTONS: [JoypadButton; 8] = [
-    JoypadButton::Up,
-    JoypadButton::Down,
-    JoypadButton::Left,
-    JoypadButton::Right,
-    JoypadButton::A,
-    JoypadButton::B,
-    JoypadButton::Start,
-    JoypadButton::Select,
+const SETTINGS_BUTTONS: [Bind; 9] = [
+    Bind::Pad(JoypadButton::Up),
+    Bind::Pad(JoypadButton::Down),
+    Bind::Pad(JoypadButton::Left),
+    Bind::Pad(JoypadButton::Right),
+    Bind::Pad(JoypadButton::A),
+    Bind::Pad(JoypadButton::B),
+    Bind::Pad(JoypadButton::Start),
+    Bind::Pad(JoypadButton::Select),
+    Bind::Menu,
 ];
 
 const FRAME_TIME: Duration = Duration::from_nanos(16_742_706);
@@ -56,15 +57,15 @@ enum Screen {
 #[derive(Clone, Copy, PartialEq)]
 enum Listening {
     None,
-    Key(JoypadButton),
-    Pad(JoypadButton),
+    Key(Bind),
+    Pad(Bind),
 }
 
 #[derive(Clone, Copy, PartialEq)]
 enum SetItem {
     ChangeFolder,
     Device,
-    Map(JoypadButton, bool),
+    Map(Bind, bool),
     Palette,
     Shader(usize),
 }
@@ -202,6 +203,7 @@ pub struct App {
     play_since: Option<Instant>,
     prev_pad: JoypadState,
     listening: Listening,
+    lib_gear_focus: bool,
     browser_from: Screen,
     settings_focus: usize,
     settings_scroll: bool,
@@ -223,7 +225,7 @@ impl App {
             current: None,
             states: StateStore::load(),
             state_textures: HashMap::new(),
-            controls: default_controls(),
+            controls: config.controls.clone(),
             gilrs: Gilrs::new().ok(),
             rgba: vec![0; SCREEN_WIDTH * SCREEN_HEIGHT * 4],
             error: None,
@@ -234,6 +236,7 @@ impl App {
             play_since: None,
             prev_pad: JoypadState::new(),
             listening: Listening::None,
+            lib_gear_focus: false,
             browser_from: Screen::Library,
             settings_focus: 0,
             settings_scroll: false,
@@ -378,6 +381,7 @@ impl App {
     }
 
     fn launch(&mut self, entry: RomEntry) {
+        self.lib_gear_focus = false;
         if let Some(meta) = self.states.find(&entry.path).cloned() {
             self.resume_state(meta);
             return;
@@ -410,6 +414,13 @@ impl App {
         self.screen = Screen::Browser;
     }
 
+    fn open_settings(&mut self) {
+        self.lib_gear_focus = false;
+        self.settings_focus = 0;
+        self.settings_scroll = true;
+        self.screen = Screen::Settings;
+    }
+
     fn after_boot(&mut self) {
         self.boot_started = None;
         if self.config.rom_dir.as_ref().is_some_and(|d| d.is_dir()) {
@@ -419,7 +430,7 @@ impl App {
         }
     }
 
-    fn handle_menu_input(&mut self, ctx: &egui::Context, captured_pad: Option<Button>) {
+    fn handle_menu_input(&mut self, ctx: &egui::Context, captured_pad: Option<(Button, Code)>) {
         let pad = ctx.input(|i| read_joypad_state(i, self.gilrs.as_mut(), &self.controls));
         let just = |b: JoypadButton| pad.is_pressed(b) && !self.prev_pad.is_pressed(b);
         let up = just(JoypadButton::Up);
@@ -488,13 +499,24 @@ impl App {
         match self.screen {
             Screen::Library => {
                 if menu_btn {
-                    self.settings_focus = 0;
-                    self.settings_scroll = true;
-                    self.screen = Screen::Settings;
+                    self.open_settings();
+                    return;
+                }
+                
+                if self.lib_gear_focus {
+                    if select {
+                        self.open_settings();
+                    } else if down {
+                        self.lib_gear_focus = false;
+                    }
                     return;
                 }
                 let rows = self.library_rows();
                 let count = rows.len();
+                if up && (count == 0 || self.sel == 0) {
+                    self.lib_gear_focus = true;
+                    return;
+                }
                 if count > 0 {
                     if self.sel >= count {
                         self.sel = count - 1;
@@ -502,7 +524,7 @@ impl App {
                     if down {
                         self.sel = (self.sel + 1) % count;
                     } else if up {
-                        self.sel = (self.sel + count - 1) % count;
+                        self.sel -= 1;
                     }
                     if select {
                         match rows[self.sel] {
@@ -612,7 +634,7 @@ impl App {
         self.prev_pad = ctx.input(|i| read_joypad_state(i, self.gilrs.as_mut(), &self.controls));
     }
 
-    fn rebind_key(&mut self, button: JoypadButton, key: Key) {
+    fn rebind_key(&mut self, button: Bind, key: Key) {
         if let Some(control) = self.controls.iter_mut().find(|c| c.button == button) {
             match control
                 .inputs
@@ -625,15 +647,22 @@ impl App {
         }
     }
 
-    fn rebind_pad(&mut self, button: JoypadButton, pad_button: Button) {
+    fn rebind_pad(&mut self, button: Bind, captured: (Button, Code)) {
+        let (pad_button, code) = captured;
+        let new = if pad_button == Button::Unknown {
+            InputBinding::GamepadCode(code)
+        } else {
+            InputBinding::GamepadButton(pad_button)
+        };
         if let Some(control) = self.controls.iter_mut().find(|c| c.button == button) {
-            match control
-                .inputs
-                .iter_mut()
-                .find(|b| matches!(b, InputBinding::GamepadButton(_)))
-            {
-                Some(slot) => *slot = InputBinding::GamepadButton(pad_button),
-                None => control.inputs.push(InputBinding::GamepadButton(pad_button)),
+            match control.inputs.iter_mut().find(|b| {
+                matches!(
+                    b,
+                    InputBinding::GamepadButton(_) | InputBinding::GamepadCode(_)
+                )
+            }) {
+                Some(slot) => *slot = new,
+                None => control.inputs.push(new),
             }
         }
     }
@@ -659,13 +688,19 @@ impl App {
                             .color(pal.scr3),
                     );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let gear_color = if self.screen == Screen::Settings {
+                        let gear_focused =
+                            self.screen == Screen::Library && self.lib_gear_focus;
+                        let gear_color = if self.screen == Screen::Settings || gear_focused {
                             pal.acc
                         } else {
                             pal.scr2
                         };
-                        if icon_button(ui, gear_color, pal.acc, draw_gear).clicked() {
+                        let gear = icon_button(ui, gear_color, pal.acc, draw_gear);
+                        if gear.clicked() {
                             go_settings = true;
+                        }
+                        if gear_focused {
+                            focus_ring(ui, gear.rect, pal, false);
                         }
                     });
                 });
@@ -676,6 +711,7 @@ impl App {
             .hline(rect.x_range(), rect.bottom(), Stroke::new(1.0, pal.line));
 
         if go_settings {
+            self.lib_gear_focus = false;
             self.screen = if self.screen == Screen::Settings {
                 Screen::Library
             } else {
@@ -764,7 +800,11 @@ impl App {
         }
 
         let ctx = ui.ctx().clone();
-        let sel = self.sel;
+        let sel = if self.lib_gear_focus {
+            usize::MAX
+        } else {
+            self.sel
+        };
         let mut action: Option<LibAction> = None;
 
         egui::ScrollArea::vertical()
@@ -1156,12 +1196,13 @@ impl App {
     fn ui_playing(&mut self, ui: &mut egui::Ui, pal: Palette) {
         let ctx = ui.ctx().clone();
 
-        if ctx.input(|i| i.key_pressed(Key::Escape)) {
+        let joypad = ctx.input(|i| read_joypad_state(i, self.gilrs.as_mut(), &self.controls));
+
+        if ctx.input(|i| menu_pressed(i, self.gilrs.as_ref(), &self.controls)) {
             self.pause();
+            ctx.request_repaint();
             return;
         }
-
-        let joypad = ctx.input(|i| read_joypad_state(i, self.gilrs.as_mut(), &self.controls));
 
         let mut has_audio = false;
         if let Some(session) = self.session.as_mut() {
@@ -1274,11 +1315,11 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
 
-        let mut captured_pad: Option<Button> = None;
+        let mut captured_pad: Option<(Button, Code)> = None;
         if let Some(gilrs) = self.gilrs.as_mut() {
             while let Some(ev) = gilrs.next_event() {
-                if let EventType::ButtonPressed(button, _) = ev.event {
-                    captured_pad.get_or_insert(button);
+                if let EventType::ButtonPressed(button, code) = ev.event {
+                    captured_pad.get_or_insert((button, code));
                 }
             }
         }
@@ -1321,6 +1362,7 @@ impl eframe::App for App {
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        self.config.controls = self.controls.clone();
         self.config.store(storage);
     }
 

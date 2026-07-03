@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::input::{default_controls, ControlBinding};
 use crate::theme::PaletteKind;
 
 const CONFIG_KEY: &str = "config";
@@ -37,12 +38,24 @@ impl Default for Shaders {
     }
 }
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub rom_dir: Option<PathBuf>,
     pub palette: PaletteKind,
     pub shaders: Shaders,
+    pub controls: Vec<ControlBinding>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            rom_dir: None,
+            palette: PaletteKind::default(),
+            shaders: Shaders::default(),
+            controls: default_controls(),
+        }
+    }
 }
 
 impl Config {

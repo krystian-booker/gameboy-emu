@@ -11,4 +11,4 @@ egui = "0.35"
 serde = { version = "1", features = ["derive"] }
 bincode = "1"
 cpal = "0.15"
-gilrs = "0.11"
+gilrs = { version = "0.11", features = ["serde-serialize"] }
