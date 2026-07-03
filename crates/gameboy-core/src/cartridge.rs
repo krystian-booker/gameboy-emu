@@ -123,7 +123,12 @@ impl Cartridge {
         }
 
         let rom = rom[..header.rom_size].to_vec();
-        let ram = vec![0; header.ram_size];
+        let ram_len = if header.ram_size == 0 && has_ram(header.cartridge_type) {
+            RAM_BANK_SIZE
+        } else {
+            header.ram_size
+        };
+        let ram = vec![0; ram_len];
         let mapper = match header.mapper_kind {
             MapperKind::NoMbc => Mapper::NoMbc,
             MapperKind::Mbc1 => Mapper::Mbc1(Mbc1 {
@@ -688,6 +693,13 @@ fn mapper_kind(cartridge_type: u8) -> Result<MapperKind> {
         0x19..=0x1E => Ok(MapperKind::Mbc5),
         _ => Err(EmulatorError::UnsupportedCartridge { cartridge_type }),
     }
+}
+
+fn has_ram(cartridge_type: u8) -> bool {
+    matches!(
+        cartridge_type,
+        0x02 | 0x03 | 0x08 | 0x09 | 0x0C | 0x0D | 0x10 | 0x12 | 0x13 | 0x1A | 0x1B | 0x1D | 0x1E
+    )
 }
 
 fn has_battery(cartridge_type: u8) -> bool {

@@ -1,7 +1,6 @@
 pub const SAMPLE_RATE: u32 = 44_100;
 
 const CPU_HZ: u32 = 4_194_304;
-const FRAME_SEQUENCER_PERIOD: u32 = CPU_HZ / 512;
 const DUTY_PATTERNS: [[u8; 8]; 4] = [
     [0, 0, 0, 0, 0, 0, 0, 1],
     [1, 0, 0, 0, 0, 0, 0, 1],
@@ -17,8 +16,8 @@ pub struct AudioSample {
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Apu {
+    cgb: bool,
     powered: bool,
-    frame_cycles: u32,
     frame_step: u8,
     sample_cycles: u32,
     sample_buffer: Vec<AudioSample>,
@@ -103,8 +102,8 @@ struct NoiseChannel {
 impl Default for Apu {
     fn default() -> Self {
         Self {
+            cgb: false,
             powered: false,
-            frame_cycles: 0,
             frame_step: 0,
             sample_cycles: 0,
             sample_buffer: Vec::new(),
@@ -119,6 +118,10 @@ impl Default for Apu {
 }
 
 impl Apu {
+    pub fn set_cgb(&mut self, enabled: bool) {
+        self.cgb = enabled;
+    }
+
     pub fn advance_cycles(&mut self, cycles: u32) {
         if !self.powered {
             return;
@@ -126,11 +129,6 @@ impl Apu {
 
         for _ in 0..cycles {
             self.clock_channels();
-            self.frame_cycles += 1;
-            if self.frame_cycles >= FRAME_SEQUENCER_PERIOD {
-                self.frame_cycles -= FRAME_SEQUENCER_PERIOD;
-                self.clock_frame_sequencer();
-            }
 
             self.sample_cycles += SAMPLE_RATE;
             if self.sample_cycles >= CPU_HZ {
@@ -138,6 +136,13 @@ impl Apu {
                 self.sample_buffer.push(self.mix_sample());
             }
         }
+    }
+
+    pub fn step_frame_sequencer(&mut self) {
+        if !self.powered {
+            return;
+        }
+        self.clock_frame_sequencer();
     }
 
     pub fn drain_samples(&mut self) -> Vec<AudioSample> {
@@ -191,6 +196,15 @@ impl Apu {
         }
 
         if !self.powered {
+            if !self.cgb {
+                match address {
+                    0xFF11 => self.pulse1.write_length_off(value),
+                    0xFF16 => self.pulse2.write_length_off(value),
+                    0xFF1B => self.wave.write_length_off(value),
+                    0xFF20 => self.noise.write_length_off(value),
+                    _ => {}
+                }
+            }
             return matches!(address, 0xFF10..=0xFF25);
         }
 
@@ -237,57 +251,48 @@ impl Apu {
 
         self.powered = power;
         if power {
-            self.frame_cycles = 0;
             self.frame_step = 0;
         } else {
+            let cgb = self.cgb;
             let wave_ram = self.wave.wave_ram;
             let pulse1_length = self.pulse1.length_timer;
             let pulse2_length = self.pulse2.length_timer;
             let wave_length = self.wave.length_timer;
             let noise_length = self.noise.length_timer;
             *self = Self::default();
+            self.cgb = cgb;
             self.wave.wave_ram = wave_ram;
-            self.pulse1.length_timer = pulse1_length;
-            self.pulse2.length_timer = pulse2_length;
-            self.wave.length_timer = wave_length;
-            self.noise.length_timer = noise_length;
+            if !cgb {
+                self.pulse1.length_timer = pulse1_length;
+                self.pulse2.length_timer = pulse2_length;
+                self.wave.length_timer = wave_length;
+                self.noise.length_timer = noise_length;
+            }
         }
     }
 
     fn write_pulse1_nr14(&mut self, value: u8) {
-        let was_enabled = self.pulse1.length_enabled;
-        self.pulse1.write_nr14(value);
-        if !was_enabled && self.pulse1.length_enabled && self.extra_length_clock_on_enable() {
-            self.pulse1.clock_length();
-        }
+        let extra_clock = self.in_extra_length_clock_phase();
+        self.pulse1.write_nr14(value, extra_clock);
     }
 
     fn write_pulse2_nr14(&mut self, value: u8) {
-        let was_enabled = self.pulse2.length_enabled;
-        self.pulse2.write_nr14(value);
-        if !was_enabled && self.pulse2.length_enabled && self.extra_length_clock_on_enable() {
-            self.pulse2.clock_length();
-        }
+        let extra_clock = self.in_extra_length_clock_phase();
+        self.pulse2.write_nr14(value, extra_clock);
     }
 
     fn write_wave_nr34(&mut self, value: u8) {
-        let was_enabled = self.wave.length_enabled;
-        self.wave.write_nr34(value);
-        if !was_enabled && self.wave.length_enabled && self.extra_length_clock_on_enable() {
-            self.wave.clock_length();
-        }
+        let extra_clock = self.in_extra_length_clock_phase();
+        self.wave.write_nr34(value, extra_clock);
     }
 
     fn write_noise_nr44(&mut self, value: u8) {
-        let was_enabled = self.noise.length_enabled;
-        self.noise.write_nr44(value);
-        if !was_enabled && self.noise.length_enabled && self.extra_length_clock_on_enable() {
-            self.noise.clock_length();
-        }
+        let extra_clock = self.in_extra_length_clock_phase();
+        self.noise.write_nr44(value, extra_clock);
     }
 
-    fn extra_length_clock_on_enable(&self) -> bool {
-        !matches!((self.frame_step + 1) & 0x07, 0 | 2 | 4 | 6)
+    fn in_extra_length_clock_phase(&self) -> bool {
+        !matches!(self.frame_step, 0 | 2 | 4 | 6)
     }
 
     fn clock_channels(&mut self) {
@@ -298,24 +303,26 @@ impl Apu {
     }
 
     fn clock_frame_sequencer(&mut self) {
-        self.frame_step = (self.frame_step + 1) & 0x07;
+        let step = self.frame_step;
 
-        if matches!(self.frame_step, 0 | 2 | 4 | 6) {
+        if matches!(step, 0 | 2 | 4 | 6) {
             self.pulse1.clock_length();
             self.pulse2.clock_length();
             self.wave.clock_length();
             self.noise.clock_length();
         }
 
-        if matches!(self.frame_step, 2 | 6) {
+        if matches!(step, 2 | 6) {
             self.pulse1.clock_sweep();
         }
 
-        if self.frame_step == 7 {
+        if step == 7 {
             self.pulse1.clock_envelope();
             self.pulse2.clock_envelope();
             self.noise.clock_envelope();
         }
+
+        self.frame_step = (step + 1) & 0x07;
     }
 
     fn mix_sample(&self) -> AudioSample {
@@ -394,6 +401,11 @@ impl PulseChannel {
         self.sweep_shift = value & 0x07;
     }
 
+    fn write_length_off(&mut self, value: u8) {
+        self.duty = value >> 6;
+        self.length_timer = 64 - (value & 0x3F) as u16;
+    }
+
     fn write_nr11(&mut self, value: u8) {
         self.nr11 = value;
         self.duty = value >> 6;
@@ -416,19 +428,30 @@ impl PulseChannel {
         self.frequency = (self.frequency & 0x0700) | value as u16;
     }
 
-    fn write_nr14(&mut self, value: u8) {
+    fn write_nr14(&mut self, value: u8, extra_clock: bool) {
+        let trigger = value & 0x80 != 0;
+        let was_enabled = self.length_enabled;
         self.nr14 = value & 0xC7;
         self.length_enabled = value & 0x40 != 0;
         self.frequency = (self.frequency & 0x00FF) | (((value & 0x07) as u16) << 8);
-        if value & 0x80 != 0 {
-            self.trigger();
+        if extra_clock && !was_enabled && self.length_enabled && self.length_timer > 0 {
+            self.length_timer -= 1;
+            if self.length_timer == 0 && !trigger {
+                self.enabled = false;
+            }
+        }
+        if trigger {
+            self.trigger(extra_clock);
         }
     }
 
-    fn trigger(&mut self) {
+    fn trigger(&mut self, extra_clock: bool) {
         self.enabled = self.dac_enabled;
         if self.length_timer == 0 {
             self.length_timer = 64;
+            if self.length_enabled && extra_clock {
+                self.length_timer -= 1;
+            }
         }
         self.period_timer = self.period();
         self.volume = self.envelope_initial;
@@ -558,6 +581,10 @@ impl WaveChannel {
         }
     }
 
+    fn write_length_off(&mut self, value: u8) {
+        self.length_timer = 256 - value as u16;
+    }
+
     fn write_nr31(&mut self, value: u8) {
         self.nr31 = value;
         self.length_timer = 256 - value as u16;
@@ -573,19 +600,30 @@ impl WaveChannel {
         self.frequency = (self.frequency & 0x0700) | value as u16;
     }
 
-    fn write_nr34(&mut self, value: u8) {
+    fn write_nr34(&mut self, value: u8, extra_clock: bool) {
+        let trigger = value & 0x80 != 0;
+        let was_enabled = self.length_enabled;
         self.nr34 = value & 0xC7;
         self.length_enabled = value & 0x40 != 0;
         self.frequency = (self.frequency & 0x00FF) | (((value & 0x07) as u16) << 8);
-        if value & 0x80 != 0 {
-            self.trigger();
+        if extra_clock && !was_enabled && self.length_enabled && self.length_timer > 0 {
+            self.length_timer -= 1;
+            if self.length_timer == 0 && !trigger {
+                self.enabled = false;
+            }
+        }
+        if trigger {
+            self.trigger(extra_clock);
         }
     }
 
-    fn trigger(&mut self) {
+    fn trigger(&mut self, extra_clock: bool) {
         self.enabled = self.dac_enabled;
         if self.length_timer == 0 {
             self.length_timer = 256;
+            if self.length_enabled && extra_clock {
+                self.length_timer -= 1;
+            }
         }
         self.period_timer = self.period();
         self.sample_index = 0;
@@ -661,6 +699,10 @@ impl Default for NoiseChannel {
 }
 
 impl NoiseChannel {
+    fn write_length_off(&mut self, value: u8) {
+        self.length_timer = 64 - (value & 0x3F) as u16;
+    }
+
     fn write_nr41(&mut self, value: u8) {
         self.nr41 = value & 0x3F;
         self.length_timer = 64 - (value & 0x3F) as u16;
@@ -684,18 +726,29 @@ impl NoiseChannel {
         self.divisor_code = value & 0x07;
     }
 
-    fn write_nr44(&mut self, value: u8) {
+    fn write_nr44(&mut self, value: u8, extra_clock: bool) {
+        let trigger = value & 0x80 != 0;
+        let was_enabled = self.length_enabled;
         self.nr44 = value & 0xC0;
         self.length_enabled = value & 0x40 != 0;
-        if value & 0x80 != 0 {
-            self.trigger();
+        if extra_clock && !was_enabled && self.length_enabled && self.length_timer > 0 {
+            self.length_timer -= 1;
+            if self.length_timer == 0 && !trigger {
+                self.enabled = false;
+            }
+        }
+        if trigger {
+            self.trigger(extra_clock);
         }
     }
 
-    fn trigger(&mut self) {
+    fn trigger(&mut self, extra_clock: bool) {
         self.enabled = self.dac_enabled;
         if self.length_timer == 0 {
             self.length_timer = 64;
+            if self.length_enabled && extra_clock {
+                self.length_timer -= 1;
+            }
         }
         self.period_timer = self.period();
         self.volume = self.envelope_initial;
@@ -781,6 +834,34 @@ mod tests {
     }
 
     #[test]
+    fn dmg_allows_length_writes_while_powered_off_without_exposing_register() {
+        let mut apu = Apu::default();
+        apu.set_cgb(false);
+        apu.write_register(0xFF11, 0x03);
+        assert_eq!(apu.pulse1.length_timer, 64 - 3);
+        assert_eq!(apu.read_register(0xFF11), Some(0x3F));
+    }
+
+    #[test]
+    fn cgb_ignores_length_writes_while_powered_off() {
+        let mut apu = Apu::default();
+        apu.set_cgb(true);
+        apu.write_register(0xFF11, 0x03);
+        assert_eq!(apu.pulse1.length_timer, 0);
+    }
+
+    #[test]
+    fn trigger_extra_clocks_length_when_reloaded_in_extra_clock_phase() {
+        let mut apu = Apu::default();
+        power_on(&mut apu);
+        apu.step_frame_sequencer();
+        assert!(apu.in_extra_length_clock_phase());
+        apu.write_register(0xFF12, 0xF0);
+        apu.write_register(0xFF14, 0xC0);
+        assert_eq!(apu.pulse1.length_timer, 63);
+    }
+
+    #[test]
     fn power_control_gates_register_writes_and_channel_status() {
         let mut apu = Apu::default();
 
@@ -824,7 +905,9 @@ mod tests {
         apu.write_register(0xFF12, 0xF0);
         apu.write_register(0xFF14, 0xC0);
 
-        apu.advance_cycles(FRAME_SEQUENCER_PERIOD * 8);
+        for _ in 0..200 {
+            apu.step_frame_sequencer();
+        }
 
         assert_eq!(apu.read_register(0xFF26).unwrap() & 0x01, 0);
     }
@@ -834,11 +917,11 @@ mod tests {
         let mut apu = Apu::default();
         power_on(&mut apu);
         apu.write_register(0xFF30, 0xF0);
+        assert_eq!(apu.read_register(0xFF30), Some(0xF0));
+
         apu.write_register(0xFF1A, 0x80);
         apu.write_register(0xFF1C, 0x20);
         apu.write_register(0xFF1E, 0x80);
-
-        assert_eq!(apu.read_register(0xFF30), Some(0xF0));
         assert_eq!(apu.read_register(0xFF26).unwrap() & 0x04, 0x04);
     }
 

@@ -54,8 +54,7 @@ pub const INTERRUPT_JOYPAD: u8 = 4;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct Timer {
-    div: u8,
-    div_cycles: u32,
+    div_counter: u16,
     tima: u8,
     tma: u8,
     tac: u8,
@@ -143,10 +142,14 @@ impl Bus {
         self.apu.advance_cycles(display_cycles);
         self.advance_dma(cycles);
 
-        self.timer.div_cycles += cycles;
-        while self.timer.div_cycles >= 256 {
-            self.timer.div_cycles -= 256;
-            self.timer.div = self.timer.div.wrapping_add(1);
+        let fs_bit = if self.cgb.double_speed { 13 } else { 12 };
+        let period = 1u32 << (fs_bit + 1);
+        let start = self.timer.div_counter as u32;
+        let end = start + cycles;
+        let fs_edges = end / period - start / period;
+        self.timer.div_counter = (end & 0xFFFF) as u16;
+        for _ in 0..fs_edges {
+            self.apu.step_frame_sequencer();
         }
 
         if self.timer.tac & 0b100 != 0 {
@@ -238,6 +241,7 @@ impl Bus {
         self.cgb.svbk = 0;
         self.cgb.div_remainder = 0;
         self.ppu.set_cgb(enabled);
+        self.apu.set_cgb(enabled);
     }
 
     pub fn stop(&mut self) -> bool {
@@ -297,7 +301,7 @@ impl Bus {
                 .read_oam(address - OAM_START)
                 .ok_or(EmulatorError::InvalidMemoryAccess { address }),
             UNUSABLE_START..=UNUSABLE_END => Ok(0xFF),
-            DIV => Ok(self.timer.div),
+            DIV => Ok((self.timer.div_counter >> 8) as u8),
             TIMA => Ok(self.timer.tima),
             TMA => Ok(self.timer.tma),
             TAC => Ok(self.timer.tac | 0xF8),
@@ -369,8 +373,11 @@ impl Bus {
             OAM_START..=OAM_END => self.ppu.write_oam(address - OAM_START, value),
             UNUSABLE_START..=UNUSABLE_END => true,
             DIV => {
-                self.timer.div = 0;
-                self.timer.div_cycles = 0;
+                let fs_bit = if self.cgb.double_speed { 13 } else { 12 };
+                if self.timer.div_counter & (1 << fs_bit) != 0 {
+                    self.apu.step_frame_sequencer();
+                }
+                self.timer.div_counter = 0;
                 true
             }
             TIMA => {
@@ -591,7 +598,7 @@ impl Bus {
             }
             OAM_START..=OAM_END => self.ppu.read_oam_raw(address - OAM_START).unwrap_or(0xFF),
             UNUSABLE_START..=UNUSABLE_END => 0xFF,
-            DIV => self.timer.div,
+            DIV => (self.timer.div_counter >> 8) as u8,
             TIMA => self.timer.tima,
             TMA => self.timer.tma,
             TAC => self.timer.tac | 0xF8,

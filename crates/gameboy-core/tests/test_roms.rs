@@ -10,8 +10,14 @@ fn workspace_rom(path: impl AsRef<Path>) -> PathBuf {
 
 fn assert_blargg_passes(path: impl AsRef<Path>, max_frames: u64) {
     let path = workspace_rom(path);
-    let run = run_blargg_test_rom(&path, TestRomConfig { max_frames })
-        .unwrap_or_else(|err| panic!("failed to run {}: {err}", path.display()));
+    let run = run_blargg_test_rom(
+        &path,
+        TestRomConfig {
+            max_frames,
+            ..TestRomConfig::default()
+        },
+    )
+    .unwrap_or_else(|err| panic!("failed to run {}: {err}", path.display()));
 
     assert_eq!(
         run.status,

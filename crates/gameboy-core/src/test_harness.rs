@@ -1,6 +1,6 @@
 use std::{fs, path::Path};
 
-use crate::{Emulator, Result};
+use crate::{Emulator, HardwareModel, Result};
 
 const EXTERNAL_RESULT_ADDRESS: u16 = 0xA000;
 const EXTERNAL_TEXT_ADDRESS: u16 = 0xA004;
@@ -25,11 +25,15 @@ pub struct TestRomRun {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TestRomConfig {
     pub max_frames: u64,
+    pub model: HardwareModel,
 }
 
 impl Default for TestRomConfig {
     fn default() -> Self {
-        Self { max_frames: 3_600 }
+        Self {
+            max_frames: 3_600,
+            model: HardwareModel::Auto,
+        }
     }
 }
 
@@ -48,7 +52,7 @@ pub fn run_blargg_test_rom(path: impl AsRef<Path>, config: TestRomConfig) -> Res
 
 pub fn run_blargg_test_rom_bytes(rom: Vec<u8>, config: TestRomConfig) -> Result<TestRomRun> {
     let mut emulator = Emulator::new();
-    emulator.load_rom(rom)?;
+    emulator.load_rom_with_model(rom, config.model)?;
 
     let mut serial_output = Vec::new();
     let mut cycles = 0;
@@ -166,7 +170,7 @@ mod tests {
     #[test]
     fn detects_pass_from_serial_output() {
         let run =
-            run_blargg_test_rom_bytes(serial_program("Passed\n"), TestRomConfig { max_frames: 1 })
+            run_blargg_test_rom_bytes(serial_program("Passed\n"), TestRomConfig { max_frames: 1, model: HardwareModel::Auto })
                 .expect("run test ROM");
 
         assert_eq!(run.status, TestRomStatus::Passed);
@@ -177,7 +181,7 @@ mod tests {
     fn detects_failure_from_serial_output() {
         let run = run_blargg_test_rom_bytes(
             serial_program("Failed #1\n"),
-            TestRomConfig { max_frames: 1 },
+            TestRomConfig { max_frames: 1, model: HardwareModel::Auto },
         )
         .expect("run test ROM");
 
@@ -188,7 +192,7 @@ mod tests {
     #[test]
     fn reports_timeout_when_no_result_is_emitted() {
         let run =
-            run_blargg_test_rom_bytes(serial_program("Running\n"), TestRomConfig { max_frames: 1 })
+            run_blargg_test_rom_bytes(serial_program("Running\n"), TestRomConfig { max_frames: 1, model: HardwareModel::Auto })
                 .expect("run test ROM");
 
         assert_eq!(run.status, TestRomStatus::TimedOut);

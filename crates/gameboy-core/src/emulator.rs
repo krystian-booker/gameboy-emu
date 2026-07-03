@@ -11,6 +11,13 @@ use crate::{
 pub type CycleCount = u32;
 pub const DOTS_PER_FRAME: CycleCount = 456 * 154;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HardwareModel {
+    Auto,
+    Dmg,
+    Cgb,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Emulator {
     cpu: Cpu,
@@ -26,8 +33,16 @@ impl Emulator {
     }
 
     pub fn load_rom(&mut self, bytes: Vec<u8>) -> Result<()> {
+        self.load_rom_with_model(bytes, HardwareModel::Auto)
+    }
+
+    pub fn load_rom_with_model(&mut self, bytes: Vec<u8>, model: HardwareModel) -> Result<()> {
         let cartridge = Cartridge::from_bytes(bytes)?;
-        let cgb_mode = cartridge.header().supports_cgb();
+        let cgb_mode = match model {
+            HardwareModel::Auto => cartridge.header().supports_cgb(),
+            HardwareModel::Dmg => false,
+            HardwareModel::Cgb => true,
+        };
         self.bus.insert_cartridge(cartridge);
         self.bus.set_cgb_mode(cgb_mode);
         self.cpu = if cgb_mode {

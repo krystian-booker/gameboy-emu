@@ -20,7 +20,13 @@ fn main() {
         })
         .unwrap_or_else(|| TestRomConfig::default().max_frames);
 
-    let run = match run_blargg_test_rom(&path, TestRomConfig { max_frames }) {
+    let run = match run_blargg_test_rom(
+        &path,
+        TestRomConfig {
+            max_frames,
+            ..TestRomConfig::default()
+        },
+    ) {
         Ok(run) => run,
         Err(err) => {
             eprintln!("{err}");
